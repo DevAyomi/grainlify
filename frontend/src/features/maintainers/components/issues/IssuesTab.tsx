@@ -57,11 +57,11 @@ export function IssuesTab({ onNavigate, selectedProjects, onRefresh }: IssuesTab
   const [issuesError, setIssuesError] = useState<string | null>(null);
 
   // Helper function to format time ago (memoized)
-  // Accepts both updated_at (nullable) and last_seen_at (required) as fallback
-  const formatTimeAgo = useCallback((updatedAt: string | null, lastSeenAt?: string): string => {
-    // Try updated_at first, then fall back to last_seen_at
-    const dateString = updatedAt || lastSeenAt;
-    if (!dateString) return 'Unknown';
+  const formatTimeAgo = useCallback((dateString: string | null): string => {
+    if (!dateString) {
+      console.warn('Missing date string for time ago formatting');
+      return 'Unknown';
+    }
     
     try {
       const date = new Date(dateString);
@@ -334,8 +334,8 @@ export function IssuesTab({ onNavigate, selectedProjects, onRefresh }: IssuesTab
                 })
                 .map((issue) => {
                   // Convert API issue to Issue type for compatibility
-                  // Use updated_at if available, otherwise fall back to last_seen_at
-                  const timeAgoFormatted = formatTimeAgo(issue.updated_at, issue.last_seen_at);
+                  // Backend now always provides updated_at_github, so we use updated_at
+                  const timeAgoFormatted = formatTimeAgo(issue.updated_at);
                   
                   const issueForCard: Issue = {
                     id: issue.github_issue_id.toString(),

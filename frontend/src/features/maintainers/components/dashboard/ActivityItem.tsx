@@ -35,7 +35,7 @@ export function ActivityItem({ activity, index }: ActivityItemProps) {
           </div>
 
           {/* Number Badge */}
-          <div className={`px-2.5 py-1 rounded-[6px] shadow-[0_2px_8px_rgba(0,0,0,0.15)] flex-shrink-0 ${
+          <div className={`px-2.5 py-1 rounded-[6px] flex-shrink-0 ${
             activity.type === 'pr' 
               ? 'bg-[#d4af37]/50' 
               : 'bg-[#c9983a]/50'

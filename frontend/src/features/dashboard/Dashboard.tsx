@@ -341,33 +341,6 @@ export function Dashboard() {
               })}
             </nav>
 
-            {/* Admin Section - available to all users (requires password) */}
-            <div className={`${isSidebarCollapsed ? 'px-[8px]' : 'px-4'} mb-4`}>
-              <div className="h-[0.5px] opacity-[0.24] mb-4 mx-auto bg-white/20" />
-              <button
-                onClick={handleAdminClick}
-                className={`group w-full flex items-center rounded-[12px] transition-all duration-300 ${
-                  isSidebarCollapsed ? 'justify-center px-0 h-[49px]' : 'justify-start px-3 py-2.5'
-                } ${
-                  currentPage === 'admin'
-                    ? 'bg-gradient-to-r from-purple-500 to-purple-600 shadow-[inset_0px_0px_4px_0px_rgba(255,255,255,0.25)] border-[0.5px] border-[rgba(245,239,235,0.16)]'
-                    : 'hover:bg-purple-500/10'
-                }`}
-                title={isSidebarCollapsed ? 'Admin Panel' : ''}
-              >
-                <Shield className={`w-6 h-6 transition-colors ${isSidebarCollapsed ? '' : 'flex-shrink-0'} ${
-                  currentPage === 'admin' ? 'text-white' : 'text-purple-400'
-                }`} />
-                {!isSidebarCollapsed && (
-                  <span className={`ml-3 font-medium text-[14px] ${
-                    currentPage === 'admin' ? 'text-white' : 'text-purple-400'
-                  }`}>
-                    Admin Panel
-                  </span>
-                )}
-              </button>
-            </div>
-
           </div>
         </div>
       </aside>

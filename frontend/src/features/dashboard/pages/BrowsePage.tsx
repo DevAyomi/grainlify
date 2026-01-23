@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react';
 import { Dropdown } from '../../../shared/components/ui/Dropdown';
 import { ProjectCard, Project } from '../components/ProjectCard';
 import { ProjectCardSkeleton } from '../components/ProjectCardSkeleton';
-import { getPublicProjects } from '../../../shared/api/client';
+import { getPublicProjects, getEcosystems } from '../../../shared/api/client';
 
 interface BrowsePageProps {
   onProjectClick?: (id: string) => void;
@@ -78,6 +78,8 @@ export function BrowsePage({ onProjectClick }: BrowsePageProps) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [hasError, setHasError] = useState(false);
+  const [ecosystems, setEcosystems] = useState<Array<{ name: string }>>([]);
+  const [isLoadingEcosystems, setIsLoadingEcosystems] = useState(true);
 
   // Filter options data
   const filterOptions = {
@@ -89,13 +91,7 @@ export function BrowsePage({ onProjectClick }: BrowsePageProps) {
       { name: 'Rust' },
       { name: 'Java' }
     ],
-    ecosystems: [
-      { name: 'React' },
-      { name: 'Vue.js' },
-      { name: 'Angular' },
-      { name: 'Svelte' },
-      { name: 'Next.js' }
-    ],
+    ecosystems: ecosystems,
     categories: [
       { name: 'Frontend' },
       { name: 'Backend' },
@@ -112,6 +108,48 @@ export function BrowsePage({ onProjectClick }: BrowsePageProps) {
       { name: 'Documentation' }
     ]
   };
+
+  // Fetch ecosystems from API
+  useEffect(() => {
+    const fetchEcosystems = async () => {
+      setIsLoadingEcosystems(true);
+      try {
+        const response = await getEcosystems();
+        // Handle different response structures
+        let ecosystemsArray: any[] = [];
+        
+        if (response && Array.isArray(response)) {
+          ecosystemsArray = response;
+        } else if (response && response.ecosystems && Array.isArray(response.ecosystems)) {
+          ecosystemsArray = response.ecosystems;
+        } else if (response && typeof response === 'object') {
+          // Try to find any array property
+          const keys = Object.keys(response);
+          for (const key of keys) {
+            if (Array.isArray((response as any)[key])) {
+              ecosystemsArray = (response as any)[key];
+              break;
+            }
+          }
+        }
+        
+        // Filter only active ecosystems and map to expected format
+        const activeEcosystems = ecosystemsArray
+          .filter((eco: any) => eco.status === 'active')
+          .map((eco: any) => ({ name: eco.name }));
+        
+        setEcosystems(activeEcosystems);
+      } catch (err) {
+        console.error('BrowsePage: Failed to fetch ecosystems:', err);
+        // Fallback to empty array on error
+        setEcosystems([]);
+      } finally {
+        setIsLoadingEcosystems(false);
+      }
+    };
+
+    fetchEcosystems();
+  }, []);
 
   const toggleFilter = (filterType: string, value: string) => {
     setSelectedFilters(prev => ({

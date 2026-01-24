@@ -332,7 +332,11 @@ UPDATE users SET github_user_id = $2, updated_at = now() WHERE id = $1
 				redirectURL = strings.TrimSuffix(*storedRedirectURI, "/") + "/auth/callback"
 				slog.Info("OAuth redirect - using stored redirect_uri", "redirect_url", redirectURL)
 			} else if h.cfg.GitHubLoginSuccessRedirectURL != "" {
-				redirectURL = h.cfg.GitHubLoginSuccessRedirectURL
+				// If GitHubLoginSuccessRedirectURL doesn't already include /auth/callback, append it
+				redirectURL = strings.TrimSuffix(h.cfg.GitHubLoginSuccessRedirectURL, "/")
+				if !strings.HasSuffix(redirectURL, "/auth/callback") {
+					redirectURL = redirectURL + "/auth/callback"
+				}
 				slog.Info("OAuth redirect - using GitHubLoginSuccessRedirectURL", "redirect_url", redirectURL)
 			} else if h.cfg.FrontendBaseURL != "" {
 				redirectURL = strings.TrimSuffix(h.cfg.FrontendBaseURL, "/") + "/auth/callback"
@@ -348,12 +352,20 @@ UPDATE users SET github_user_id = $2, updated_at = now() WHERE id = $1
 					slog.Error("OAuth redirect - failed to parse redirect URL", "error", err, "redirect_url", redirectURL)
 					// Fall through to JSON response
 				} else {
+					// Ensure the path is set correctly (should be /auth/callback)
+					if ru.Path == "" || ru.Path == "/" {
+						ru.Path = "/auth/callback"
+					}
 					q := ru.Query()
 					q.Set("token", jwtToken)
 					q.Set("github", u.Login)
 					ru.RawQuery = q.Encode()
 					finalRedirectURL := ru.String()
-					slog.Info("OAuth redirect - redirecting user", "final_redirect_url", finalRedirectURL)
+					slog.Info("OAuth redirect - redirecting user", 
+						"final_redirect_url", finalRedirectURL,
+						"path", ru.Path,
+						"host", ru.Host,
+					)
 					return c.Redirect(finalRedirectURL, fiber.StatusFound)
 				}
 			}

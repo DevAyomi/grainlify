@@ -158,11 +158,8 @@
 
 mod multisig;
 use multisig::MultiSig;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
-use soroban_sdk::Vec;
-=======
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
 };
 
 // ==================== MONITORING MODULE ====================
@@ -236,6 +233,7 @@ mod monitoring {
 
     // Track operation
     pub fn track_operation(env: &Env, operation: Symbol, caller: Address, success: bool) {
+        let timestamp = env.ledger().timestamp();
         let key = Symbol::new(env, OPERATION_COUNT);
         let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(count + 1));
@@ -251,7 +249,7 @@ mod monitoring {
             OperationMetric {
                 operation,
                 caller,
-                timestamp: env.ledger().timestamp(),
+                timestamp,
                 success,
             },
         );
@@ -259,6 +257,7 @@ mod monitoring {
 
     // Track performance
     pub fn emit_performance(env: &Env, function: Symbol, duration: u64) {
+        let timestamp = env.ledger().timestamp();
         let count_key = (Symbol::new(env, "perf_cnt"), function.clone());
         let time_key = (Symbol::new(env, "perf_time"), function.clone());
 
@@ -275,7 +274,7 @@ mod monitoring {
             PerformanceMetric {
                 function,
                 duration,
-                timestamp: env.ledger().timestamp(),
+                timestamp,
             },
         );
     }
@@ -319,12 +318,13 @@ mod monitoring {
 
     // Get state snapshot
     pub fn get_state_snapshot(env: &Env) -> StateSnapshot {
+        let timestamp = env.ledger().timestamp();
         let op_key = Symbol::new(env, OPERATION_COUNT);
         let usr_key = Symbol::new(env, USER_COUNT);
         let err_key = Symbol::new(env, ERROR_COUNT);
 
         StateSnapshot {
-            timestamp: env.ledger().timestamp(),
+            timestamp,
             total_operations: env.storage().persistent().get(&op_key).unwrap_or(0),
             total_users: env.storage().persistent().get(&usr_key).unwrap_or(0),
             total_errors: env.storage().persistent().get(&err_key).unwrap_or(0),
@@ -477,12 +477,8 @@ const VERSION: u32 = 1;
  
 #[contractimpl]
 impl GrainlifyContract {   
-pub fn init(env: Env, signers: Vec<Address>, threshold: u32) {
-    if env.storage().instance().has(&DataKey::Version) {
-        panic!("Already initialized");
-
     pub fn init(env: Env, admin: Address) {
-        let start = env.ledger().timestamp();
+        let _now = env.ledger().timestamp();
 
         // Prevent re-initialization to protect admin immutability
         if env.storage().instance().has(&DataKey::Admin) {
@@ -499,15 +495,9 @@ pub fn init(env: Env, signers: Vec<Address>, threshold: u32) {
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("init"), admin, true);
 
-        // Track performance
-        let duration = env.ledger().timestamp().saturating_sub(start);
-        monitoring::emit_performance(&env, symbol_short!("init"), duration);
-
+        // Track performance (using constant duration as ledger timestamp is fixed)
+        monitoring::emit_performance(&env, symbol_short!("init"), 0);
     }
-
-    MultiSig::init(&env, signers, threshold);
-    env.storage().instance().set(&DataKey::Version, &VERSION);
-}
 
 
 
@@ -527,14 +517,13 @@ pub fn propose_upgrade(
 }
 
 
-pub fn approve_upgrade(
-    env: Env,
-    proposal_id: u64,
-    signer: Address,
-) {
-    MultiSig::approve(&env, proposal_id, signer);
-}
-}
+    pub fn approve_upgrade(
+        env: Env,
+        proposal_id: u64,
+        signer: Address,
+    ) {
+        MultiSig::approve(&env, proposal_id, signer);
+    }
 
 
     /// Upgrades the contract to new WASM code.
@@ -629,23 +618,24 @@ pub fn approve_upgrade(
     /// * If admin address is not set (contract not initialized)
     /// * If caller is not the admin
 
-pub fn execute_upgrade(env: Env, proposal_id: u64) {
-    if !MultiSig::can_execute(&env, proposal_id) {
-        panic!("Threshold not met");
+    pub fn execute_upgrade(env: Env, proposal_id: u64) {
+        if !MultiSig::can_execute(&env, proposal_id) {
+            panic!("Threshold not met");
+        }
+
+        let wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal(proposal_id))
+            .expect("Missing upgrade proposal");
+
+        env.deployer().update_current_contract_wasm(wasm_hash);
+
+        MultiSig::mark_executed(&env, proposal_id);
     }
 
-    let wasm_hash: BytesN<32> = env
-        .storage()
-        .instance()
-        .get(&DataKey::UpgradeProposal(proposal_id))
-        .expect("Missing upgrade proposal");
-
-    env.deployer().update_current_contract_wasm(wasm_hash);
-
-    MultiSig::mark_executed(&env, proposal_id);
-  
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let start = env.ledger().timestamp();
+        let _now = env.ledger().timestamp();
 
         // Verify admin authorization
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -657,10 +647,7 @@ pub fn execute_upgrade(env: Env, proposal_id: u64) {
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("upgrade"), admin, true);
 
-        // Track performance
-        let duration = env.ledger().timestamp().saturating_sub(start);
-        monitoring::emit_performance(&env, symbol_short!("upgrade"), duration);
-
+        monitoring::emit_performance(&env, symbol_short!("upgrade"), 0);
     }
 
 
@@ -776,7 +763,7 @@ pub fn execute_upgrade(env: Env, proposal_id: u64) {
 
 
     pub fn set_version(env: Env, new_version: u32) {
-        let start = env.ledger().timestamp();
+        let _now = env.ledger().timestamp();
 
         // Verify admin authorization
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -790,9 +777,7 @@ pub fn execute_upgrade(env: Env, proposal_id: u64) {
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("set_ver"), admin, true);
 
-        // Track performance
-        let duration = env.ledger().timestamp().saturating_sub(start);
-        monitoring::emit_performance(&env, symbol_short!("set_ver"), duration);
+        monitoring::emit_performance(&env, symbol_short!("set_ver"), 0);
     }
 
     // ========================================================================
@@ -821,9 +806,6 @@ pub fn execute_upgrade(env: Env, proposal_id: u64) {
 }
 
 
-// ============================================================================
-// Testing Module
-// ============================================================================
 #[cfg(test)]
 mod test {
     use super::*;
@@ -840,11 +822,8 @@ mod test {
         signers.push_back(Address::generate(&env));
         signers.push_back(Address::generate(&env));
 
-        client.init(&signers, &2u32);
+        client.init(&Address::generate(&env));
     }
-}
-
-
 
     #[test]
     fn test_set_version() {

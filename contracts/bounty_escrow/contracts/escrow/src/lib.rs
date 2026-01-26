@@ -169,6 +169,7 @@ mod monitoring {
 
     // Track operation
     pub fn track_operation(env: &Env, operation: Symbol, caller: Address, success: bool) {
+        let timestamp = env.ledger().timestamp();
         let key = Symbol::new(env, OPERATION_COUNT);
         let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(count + 1));
@@ -184,7 +185,7 @@ mod monitoring {
             OperationMetric {
                 operation,
                 caller,
-                timestamp: env.ledger().timestamp(),
+                timestamp,
                 success,
             },
         );
@@ -192,6 +193,7 @@ mod monitoring {
 
     // Track performance
     pub fn emit_performance(env: &Env, function: Symbol, duration: u64) {
+        let timestamp = env.ledger().timestamp();
         let count_key = (Symbol::new(env, "perf_cnt"), function.clone());
         let time_key = (Symbol::new(env, "perf_time"), function.clone());
 
@@ -208,7 +210,7 @@ mod monitoring {
             PerformanceMetric {
                 function,
                 duration,
-                timestamp: env.ledger().timestamp(),
+                timestamp,
             },
         );
     }
@@ -252,12 +254,13 @@ mod monitoring {
 
     // Get state snapshot
     pub fn get_state_snapshot(env: &Env) -> StateSnapshot {
+        let timestamp = env.ledger().timestamp();
         let op_key = Symbol::new(env, OPERATION_COUNT);
         let usr_key = Symbol::new(env, USER_COUNT);
         let err_key = Symbol::new(env, ERROR_COUNT);
 
         StateSnapshot {
-            timestamp: env.ledger().timestamp(),
+            timestamp,
             total_operations: env.storage().persistent().get(&op_key).unwrap_or(0),
             total_users: env.storage().persistent().get(&usr_key).unwrap_or(0),
             total_errors: env.storage().persistent().get(&err_key).unwrap_or(0),
@@ -363,28 +366,24 @@ mod anti_abuse {
             operation_count: 0,
         });
 
-        // 1. Cooldown check
         if state.last_operation_timestamp > 0
             && now < state.last_operation_timestamp.saturating_add(config.cooldown_period)
         {
             env.events().publish(
                 (symbol_short!("abuse"), symbol_short!("cooldown")),
-                (address.clone(), now),
+                (address, now),
             );
             panic!("Operation in cooldown period");
         }
 
-        // 2. Window check
         if now >= state.window_start_timestamp.saturating_add(config.window_size) {
-            // New window
             state.window_start_timestamp = now;
             state.operation_count = 1;
         } else {
-            // Same window
             if state.operation_count >= config.max_operations {
                 env.events().publish(
                     (symbol_short!("abuse"), symbol_short!("limit")),
-                    (address.clone(), now),
+                    (address, now),
                 );
                 panic!("Rate limit exceeded");
             }
@@ -394,7 +393,6 @@ mod anti_abuse {
         state.last_operation_timestamp = now;
         env.storage().persistent().set(&key, &state);
 
-        // Extend TTL for state (approx 1 day)
         env.storage().persistent().extend_ttl(&key, 17280, 17280);
     }
 }
@@ -573,10 +571,11 @@ impl BountyEscrowContract {
     /// # Gas Cost
     /// Low - Only two storage writes
     pub fn init(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        
         // Apply rate limiting
         anti_abuse::check_rate_limit(&env, admin.clone());
 
-        let start = env.ledger().timestamp();
         let caller = admin.clone();
 
         // Prevent re-initialization
@@ -595,7 +594,7 @@ impl BountyEscrowContract {
             BountyEscrowInitialized {
                 admin: admin.clone(),
                 token,
-                timestamp: env.ledger().timestamp(),
+                timestamp: now,
             },
         );
 
@@ -603,8 +602,7 @@ impl BountyEscrowContract {
         monitoring::track_operation(&env, symbol_short!("init"), caller, true);
 
         // Track performance
-        let duration = env.ledger().timestamp().saturating_sub(start);
-        monitoring::emit_performance(&env, symbol_short!("init"), duration);
+        monitoring::emit_performance(&env, symbol_short!("init"), 0);
 
         Ok(())
     }
@@ -670,10 +668,11 @@ impl BountyEscrowContract {
         amount: i128,
         deadline: u64,
     ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        
         // Apply rate limiting
         anti_abuse::check_rate_limit(&env, depositor.clone());
 
-        let start = env.ledger().timestamp();
         let caller = depositor.clone();
 
         // Verify depositor authorization
@@ -693,7 +692,7 @@ impl BountyEscrowContract {
             return Err(Error::InvalidAmount);
         }
 
-        if deadline <= env.ledger().timestamp() {
+        if deadline <= now {
             monitoring::track_operation(&env, symbol_short!("lock"), caller, false);
             env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::InvalidDeadline);
@@ -747,9 +746,7 @@ impl BountyEscrowContract {
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("lock"), caller, true);
 
-        // Track performance
-        let duration = env.ledger().timestamp().saturating_sub(start);
-        monitoring::emit_performance(&env, symbol_short!("lock"), duration);
+        monitoring::emit_performance(&env, symbol_short!("lock"), 0);
 
         Ok(())
     }

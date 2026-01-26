@@ -8,6 +8,24 @@ interface ApplicationsChartProps {
 
 export function ApplicationsChart({ data }: ApplicationsChartProps) {
   const { theme } = useTheme();
+ const isDark = theme === 'dark';
+
+const tooltipBg = isDark
+  ? 'bg-neutral-900/80 border-white/10'
+  : 'bg-[#e8dfd0]/95 border-white/25';
+
+const tooltipTitleText = isDark
+  ? 'text-neutral-300'
+  : 'text-[#7a6b5a]';
+
+const tooltipLabelText = isDark
+  ? 'text-neutral-400'
+  : 'text-[#7a6b5a]';
+
+const tooltipValueText = isDark
+  ? 'text-neutral-100'
+  : 'text-[#2d2820]';
+
   return (
     <div className={`backdrop-blur-[40px] rounded-[24px] border p-8 relative overflow-hidden group/chart transition-colors ${
       theme === 'dark'
@@ -52,36 +70,53 @@ export function ApplicationsChart({ data }: ApplicationsChartProps) {
                 axisLine={{ stroke: theme === 'dark' ? 'rgba(184, 168, 152, 0.2)' : 'rgba(122, 107, 90, 0.2)' }}
               />
               <Tooltip
-                cursor={{ fill: 'rgba(201, 152, 58, 0.08)' }}
-                content={({ active, payload }) => {
-                  if (active && payload && payload.length) {
-                    return (
-                      <div className="backdrop-blur-[40px] bg-[#e8dfd0]/95 rounded-[14px] border border-white/25 px-5 py-4">
-                        <div className="text-[13px] font-bold text-[#7a6b5a] mb-2">
-                          {payload[0].payload.month}
-                        </div>
-                        {payload.map((entry: any, index: number) => (
-                          <div key={index} className="flex items-center justify-between gap-4 mb-1">
-                            <div className="flex items-center gap-2">
-                              <div 
-                                className="w-3 h-3 rounded-full"
-                                style={{ backgroundColor: entry.color }}
-                              />
-                              <span className="text-[12px] text-[#7a6b5a] font-medium">
-                                {entry.dataKey === 'applications' ? 'Applications' : 'Merged'}
-                              </span>
-                            </div>
-                            <span className="text-[14px] font-bold text-[#2d2820]">
-                              {entry.value}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    );
-                  }
-                  return null;
-                }}
-              />
+  cursor={{ fill: 'rgba(201, 152, 58, 0.08)' }}
+  content={({ active, payload }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div
+          className={`backdrop-blur-[40px] rounded-[14px] border px-5 py-4 ${tooltipBg}`}
+        >
+          <div
+            className={`text-[13px] font-bold mb-2 ${tooltipTitleText}`}
+          >
+            {payload[0].payload.month}
+          </div>
+
+          {payload.map((entry: any, index: number) => (
+            <div
+              key={index}
+              className="flex items-center justify-between gap-4 mb-1"
+            >
+              <div className="flex items-center gap-2">
+                <div
+                  className="w-3 h-3 rounded-full"
+                  style={{ backgroundColor: entry.color }}
+                />
+                <span
+                  className={`text-[12px] font-medium ${tooltipLabelText}`}
+                >
+                  {entry.dataKey === 'applications'
+                    ? 'Applications'
+                    : 'Merged'}
+                </span>
+              </div>
+
+              <span
+                className={`text-[14px] font-bold ${tooltipValueText}`}
+              >
+                {entry.value}
+              </span>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    return null;
+  }}
+/>
+
               <Bar 
                 dataKey="applications" 
                 fill="url(#applicationsGradient)" 

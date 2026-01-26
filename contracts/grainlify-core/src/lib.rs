@@ -150,10 +150,6 @@
 //! - ❌ Upgrading without proper testing
 //! - ❌ Not having a rollback plan
 
-
-
-
-
 #![no_std]
 
 mod multisig;
@@ -354,7 +350,6 @@ mod monitoring {
 }
 // ==================== END MONITORING MODULE ====================
 
-
 // ============================================================================
 // Contract Definition
 // ============================================================================
@@ -367,32 +362,15 @@ pub struct GrainlifyContract;
 // ============================================================================
 
 /// Storage keys for contract data.
-///
-/// # Keys
-/// * `Admin` - Stores the administrator address (set once at initialization)
-/// * `Version` - Stores the current contract version number
-///
-/// # Storage Type
-/// Instance storage - Persists across contract upgrades
-///
-/// # Security Note
-/// These keys use instance storage to ensure data survives WASM upgrades.
-/// The admin address is immutable after initialization.
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     /// Administrator address with upgrade authority
-
-
-    
-
     Admin,
-
 
     /// Current version number (increments with upgrades)
     Version,
 
-    
     // NEW: store wasm hash per proposal
     UpgradeProposal(u64),
 }
@@ -401,84 +379,40 @@ enum DataKey {
 // Constants
 // ============================================================================
 
-/// Current contract version.
-///
-/// This constant should be incremented with each contract upgrade:
-/// - MAJOR version: Breaking changes
-/// - MINOR version: New features (backward compatible)
-/// - PATCH version: Bug fixes
-///
-/// # Version History
-/// - v1: Initial release with basic upgrade functionality
-///
-/// # Usage
-/// Set during initialization and can be updated via `set_version()`.
 const VERSION: u32 = 1;
 
 // ============================================================================
 // Contract Implementation
 // ============================================================================
 
-
+#[contractimpl]
+impl GrainlifyContract {
     // ========================================================================
     // Initialization
     // ========================================================================
 
-    /// Initializes the contract with an admin address.
+    /// Initializes the contract with multisig configuration.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `signers` - List of signer addresses for multisig
+    /// * `threshold` - Number of signatures required to execute proposals
+    pub fn init(env: Env, signers: Vec<Address>, threshold: u32) {
+        if env.storage().instance().has(&DataKey::Version) {
+            panic!("Already initialized");
+        }
+
+        MultiSig::init(&env, signers, threshold);
+        env.storage().instance().set(&DataKey::Version, &VERSION);
+    }
+
+    /// Initializes the contract with a single admin address.
     ///
     /// # Arguments
     /// * `env` - The contract environment
     /// * `admin` - Address authorized to perform upgrades
-    ///
-    /// # Panics
-    /// * If contract is already initialized
-    ///
-    /// # State Changes
-    /// - Sets Admin address in instance storage
-    /// - Sets initial Version number
-    ///
-    /// # Security Considerations
-    /// - Can only be called once (prevents admin takeover)
-    /// - Admin address is immutable after initialization
-    /// - Admin should be a secure address (hardware wallet/multi-sig)
-    /// - No authorization required for initialization (first-caller pattern)
-    ///
-    /// # Example
-    /// ```rust
-    /// use soroban_sdk::{Address, Env};
-    ///
-    /// let env = Env::default();
-    /// let admin = Address::generate(&env);
-    ///
-    /// // Initialize contract
-    /// contract.init(&env, &admin);
-    ///
-    /// // Subsequent init attempts will panic
-    /// // contract.init(&env, &another_admin); // ❌ Panics!
-    /// ```
-    ///
-    /// # Gas Cost
-    /// Low - Two storage writes
-    ///
-    /// # Production Deployment
-    /// ```bash
-    /// # Deploy contract
-    /// stellar contract deploy \
-    ///   --wasm target/wasm32-unknown-unknown/release/grainlify.wasm \
-    ///   --source ADMIN_SECRET_KEY
-    ///
-    /// # Initialize with admin address
-    /// stellar contract invoke \
-    ///   --id CONTRACT_ID \
-    ///   --source ADMIN_SECRET_KEY \
-    ///   -- init \
-    ///   --admin GADMIN_ADDRESS
-    /// ```
- 
-#[contractimpl]
-impl GrainlifyContract {   
-    pub fn init(env: Env, admin: Address) {
-        let _now = env.ledger().timestamp();
+    pub fn init_admin(env: Env, admin: Address) {
+        let start = env.ledger().timestamp();
 
         // Prevent re-initialization to protect admin immutability
         if env.storage().instance().has(&DataKey::Admin) {
@@ -495,129 +429,49 @@ impl GrainlifyContract {
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("init"), admin, true);
 
-        // Track performance (using constant duration as ledger timestamp is fixed)
-        monitoring::emit_performance(&env, symbol_short!("init"), 0);
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("init"), duration);
     }
 
+    // ========================================================================
+    // Upgrade Functions
+    // ========================================================================
 
-
-
-pub fn propose_upgrade(
-    env: Env,
-    proposer: Address,
-    wasm_hash: BytesN<32>,
-) -> u64 {
-    let proposal_id = MultiSig::propose(&env, proposer);
-
-    env.storage()
-        .instance()
-        .set(&DataKey::UpgradeProposal(proposal_id), &wasm_hash);
-
-    proposal_id
-}
-
-
-    pub fn approve_upgrade(
-        env: Env,
-        proposal_id: u64,
-        signer: Address,
-    ) {
-        MultiSig::approve(&env, proposal_id, signer);
-    }
-
-
-    /// Upgrades the contract to new WASM code.
+    /// Proposes an upgrade with a new WASM hash (multisig version).
     ///
     /// # Arguments
     /// * `env` - The contract environment
-    /// * `new_wasm_hash` - Hash of the uploaded WASM code (32 bytes)
+    /// * `proposer` - Address proposing the upgrade
+    /// * `wasm_hash` - Hash of the new WASM code
     ///
-    /// # Authorization
-    /// - **CRITICAL**: Only admin can call this function
-    /// - Admin must sign the transaction
-    ///
-    /// # State Changes
-    /// - Replaces current contract WASM with new version
-    /// - Preserves all instance storage (admin, version, etc.)
-    /// - Does NOT automatically update version number (call `set_version` separately)
-    ///
-    /// # Security Considerations
-    /// - **Code Review**: New WASM must be audited before deployment
-    /// - **Testing**: Test upgrade on testnet first
-    /// - **State Compatibility**: Ensure new code is compatible with existing state
-    /// - **Rollback Plan**: Keep previous WASM hash for emergency rollback
-    /// - **Version Update**: Call `set_version` after upgrade if needed
-    ///
-    /// # Workflow
-    /// 1. Develop and test new contract version
-    /// 2. Build WASM: `cargo build --release --target wasm32-unknown-unknown`
-    /// 3. Upload WASM to Stellar network
-    /// 4. Get WASM hash from upload response
-    /// 5. Call this function with the hash
-    /// 6. (Optional) Call `set_version` to update version number
-    ///
-    /// # Example
-    /// ```rust
-    /// use soroban_sdk::{BytesN, Env};
-    ///
-    /// let env = Env::default();
-    ///
-    /// // Upload new WASM and get hash (done off-chain)
-    /// let wasm_hash = BytesN::from_array(
-    ///     &env,
-    ///     &[0xab, 0xcd, 0xef, ...] // 32 bytes
-    /// );
-    ///
-    /// // Perform upgrade (requires admin authorization)
-    /// contract.upgrade(&env, &wasm_hash);
-    ///
-    /// // Update version number
-    /// contract.set_version(&env, &2);
-    /// ```
-    ///
-    /// # Production Upgrade Process
-    /// ```bash
-    /// # 1. Build new WASM
-    /// cargo build --release --target wasm32-unknown-unknown
-    ///
-    /// # 2. Upload WASM to Stellar
-    /// stellar contract install \
-    ///   --wasm target/wasm32-unknown-unknown/release/grainlify.wasm \
-    ///   --source ADMIN_SECRET_KEY
-    /// # Output: WASM_HASH (e.g., abc123...)
-    ///
-    /// # 3. Upgrade contract
-    /// stellar contract invoke \
-    ///   --id CONTRACT_ID \
-    ///   --source ADMIN_SECRET_KEY \
-    ///   -- upgrade \
-    ///   --new_wasm_hash WASM_HASH
-    ///
-    /// # 4. Update version (optional)
-    /// stellar contract invoke \
-    ///   --id CONTRACT_ID \
-    ///   --source ADMIN_SECRET_KEY \
-    ///   -- set_version \
-    ///   --new_version 2
-    /// ```
-    ///
-    /// # Gas Cost
-    /// High - WASM code replacement is expensive
-    ///
-    /// # Emergency Rollback
-    /// If new version has issues, rollback to previous WASM:
-    /// ```bash
-    /// stellar contract invoke \
-    ///   --id CONTRACT_ID \
-    ///   --source ADMIN_SECRET_KEY \
-    ///   -- upgrade \
-    ///   --new_wasm_hash PREVIOUS_WASM_HASH
-    /// ```
-    ///
-    /// # Panics
-    /// * If admin address is not set (contract not initialized)
-    /// * If caller is not the admin
+    /// # Returns
+    /// * `u64` - The proposal ID
+    pub fn propose_upgrade(env: Env, proposer: Address, wasm_hash: BytesN<32>) -> u64 {
+        let proposal_id = MultiSig::propose(&env, proposer);
 
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal(proposal_id), &wasm_hash);
+
+        proposal_id
+    }
+
+    /// Approves an upgrade proposal (multisig version).
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `proposal_id` - The ID of the proposal to approve
+    /// * `signer` - Address approving the proposal
+    pub fn approve_upgrade(env: Env, proposal_id: u64, signer: Address) {
+        MultiSig::approve(&env, proposal_id, signer);
+    }
+
+    /// Executes an upgrade proposal that has met the multisig threshold.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `proposal_id` - The ID of the upgrade proposal to execute
     pub fn execute_upgrade(env: Env, proposal_id: u64) {
         if !MultiSig::can_execute(&env, proposal_id) {
             panic!("Threshold not met");
@@ -634,8 +488,13 @@ pub fn propose_upgrade(
         MultiSig::mark_executed(&env, proposal_id);
     }
 
+    /// Upgrades the contract to new WASM code (single admin version).
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `new_wasm_hash` - Hash of the uploaded WASM code (32 bytes)
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let _now = env.ledger().timestamp();
+        let start = env.ledger().timestamp();
 
         // Verify admin authorization
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -647,123 +506,23 @@ pub fn propose_upgrade(
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("upgrade"), admin, true);
 
-        monitoring::emit_performance(&env, symbol_short!("upgrade"), 0);
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("upgrade"), duration);
     }
-
 
     // ========================================================================
     // Version Management
     // ========================================================================
 
     /// Retrieves the current contract version number.
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    ///
-    /// # Returns
-    /// * `u32` - Current version number (defaults to 0 if not set)
-    ///
-    /// # Usage
-    /// Use this to verify contract version for:
-    /// - Client compatibility checks
-    /// - Migration decision logic
-    /// - Audit trails
-    /// - Version-specific behavior
-    ///
-    /// # Example
-    /// ```rust
-    /// let version = contract.get_version(&env);
-    ///
-    /// match version {
-    ///     1 => println!("Running v1"),
-    ///     2 => println!("Running v2 with new features"),
-    ///     _ => println!("Unknown version"),
-    /// }
-    /// ```
-    ///
-    /// # Client-Side Usage
-    /// ```javascript
-    /// // Check contract version before interaction
-    /// const version = await contract.get_version();
-    ///
-    /// if (version < 2) {
-    ///     throw new Error("Contract version too old, please upgrade");
-    /// }
-    /// ```
-    ///
-    /// # Gas Cost
-    /// Very Low - Single storage read
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
     }
 
-
     /// Updates the contract version number.
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `new_version` - New version number to set
-    ///
-    /// # Authorization
-    /// - Only admin can call this function
-    /// - Admin must sign the transaction
-    ///
-    /// # State Changes
-    /// - Updates Version in instance storage
-    ///
-    /// # Usage
-    /// Call this function after upgrading contract WASM to reflect
-    /// the new version number. This provides an audit trail of upgrades.
-    ///
-    /// # Version Numbering Strategy
-    /// Recommend using semantic versioning encoded as single u32:
-    /// - `1` = v1.0.0
-    /// - `2` = v2.0.0
-    /// - `101` = v1.0.1 (patch)
-    /// - `110` = v1.1.0 (minor)
-    ///
-    /// Or use simple incrementing:
-    /// - `1` = First version
-    /// - `2` = Second version
-    /// - `3` = Third version
-    ///
-    /// # Example
-    /// ```rust
-    /// // After upgrading WASM
-    /// contract.upgrade(&env, &new_wasm_hash);
-    ///
-    /// // Update version to reflect the upgrade
-    /// contract.set_version(&env, &2);
-    ///
-    /// // Verify
-    /// assert_eq!(contract.get_version(&env), 2);
-    /// ```
-    ///
-    /// # Best Practice
-    /// Document version changes:
-    /// ```rust
-    /// // Version History:
-    /// // 1 - Initial release
-    /// // 2 - Added feature X, fixed bug Y
-    /// // 3 - Performance improvements
-    /// contract.set_version(&env, &3);
-    /// ```
-    ///
-    /// # Security Note
-    /// This function does NOT perform the actual upgrade.
-    /// It only updates the version metadata. Always call
-    /// `upgrade()` first, then `set_version()`.
-    ///
-    /// # Gas Cost
-    /// Very Low - Single storage write
-    ///
-    /// # Panics
-    /// * If admin address is not set (contract not initialized)
-    /// * If caller is not the admin
-
-
     pub fn set_version(env: Env, new_version: u32) {
-        let _now = env.ledger().timestamp();
+        let start = env.ledger().timestamp();
 
         // Verify admin authorization
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -777,7 +536,9 @@ pub fn propose_upgrade(
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("set_ver"), admin, true);
 
-        monitoring::emit_performance(&env, symbol_short!("set_ver"), 0);
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("set_ver"), duration);
     }
 
     // ========================================================================
@@ -805,7 +566,6 @@ pub fn propose_upgrade(
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -822,7 +582,7 @@ mod test {
         signers.push_back(Address::generate(&env));
         signers.push_back(Address::generate(&env));
 
-        client.init(&Address::generate(&env));
+        client.init(&signers, &2);
     }
 
     #[test]
@@ -834,10 +594,9 @@ mod test {
         let client = GrainlifyContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.init(&admin);
+        client.init_admin(&admin);
 
         client.set_version(&2);
         assert_eq!(client.get_version(), 2);
     }
 }
-

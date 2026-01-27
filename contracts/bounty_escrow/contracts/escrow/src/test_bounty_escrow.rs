@@ -113,7 +113,7 @@ fn test_release_fund() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #11)")]
 fn test_lock_fund_invalid_amount() {
     let (env, client, _contract_id) = create_test_env();
     let admin = Address::generate(&env);
@@ -133,7 +133,7 @@ fn test_lock_fund_invalid_amount() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #12)")]
 fn test_lock_fund_invalid_deadline() {
     let (env, client, _contract_id) = create_test_env();
     let admin = Address::generate(&env);

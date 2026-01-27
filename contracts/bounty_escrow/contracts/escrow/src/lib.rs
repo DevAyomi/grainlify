@@ -1004,6 +1004,7 @@ impl BountyEscrowContract {
         recipient: Option<Address>,
         mode: RefundMode,
     ) -> Result<(), Error> {
+        let start = env.ledger().timestamp();
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             let caller = env.current_contract_address();
             monitoring::track_operation(&env, symbol_short!("refund"), caller, false);
@@ -1184,6 +1185,63 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap())
+    }
+
+    /// Retrieves refund history for a specific bounty.
+    pub fn get_refund_history(env: Env, bounty_id: u64) -> Result<Vec<RefundRecord>, Error> {
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            return Err(Error::BountyNotFound);
+        }
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap();
+        Ok(escrow.refund_history)
+    }
+
+    /// Checks if a bounty is eligible for refund and returns status details.
+    /// Returns: (can_refund, deadline_passed, remaining_amount, approval)
+    pub fn get_refund_eligibility(
+        env: Env,
+        bounty_id: u64,
+    ) -> Result<(bool, bool, i128, Option<RefundApproval>), Error> {
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            return Err(Error::BountyNotFound);
+        }
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap();
+
+        let now = env.ledger().timestamp();
+        let deadline_passed = now >= escrow.deadline;
+
+        // Check for approval
+        let approval: Option<RefundApproval> = if env
+            .storage()
+            .persistent()
+            .has(&DataKey::RefundApproval(bounty_id))
+        {
+            Some(
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::RefundApproval(bounty_id))
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+
+        let can_refund = deadline_passed || approval.is_some();
+
+        Ok((
+            can_refund,
+            deadline_passed,
+            escrow.remaining_amount,
+            approval,
+        ))
     }
 
     /// Returns the current token balance held by the contract.

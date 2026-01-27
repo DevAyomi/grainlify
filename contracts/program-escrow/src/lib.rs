@@ -139,10 +139,25 @@
 //! 6. **Token Approval**: Ensure contract has token allowance before locking funds
 
 #![no_std]
+
+// Error recovery and retry modules
+mod error_recovery;
+mod retry_executor;
+
+#[cfg(test)]
+mod error_recovery_tests;
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, vec, Address, Env, String, Symbol,
     Vec,
 };
+
+// Re-export error recovery types for external use
+pub use error_recovery::{
+    BatchItemError, BatchResult, CircuitBreaker, CircuitState, ErrorClass, ErrorState,
+    RecoveryError, RecoveryStrategy, RetryConfig,
+};
+pub use retry_executor::{RetryContext, RetryResult};
 
 // ==================== MONITORING MODULE ====================
 mod monitoring {
@@ -1367,7 +1382,7 @@ impl ProgramEscrowContract {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _},
+        testutils::{Address as _, Ledger},
         token, Address, Env, String,
     };
 

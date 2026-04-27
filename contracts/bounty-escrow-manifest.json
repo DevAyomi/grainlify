@@ -659,6 +659,18 @@
         "gas_estimate": "low"
       },
       {
+        "name": "get_refund_schema_version",
+        "description": "Return the upgrade-safe schema marker for refund eligibility view semantics",
+        "parameters": [],
+        "returns": {
+          "type": "u32",
+          "description": "Refund eligibility schema version, or 0 for legacy deployments without the marker"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
         "name": "health_check",
         "description": "Get contract health status",
         "parameters": [],

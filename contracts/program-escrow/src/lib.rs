@@ -1960,6 +1960,33 @@ impl ProgramEscrowContract {
                 .set(&DataKey::PauseSchemaVersion, &PAUSE_SCHEMA_VERSION_V1);
         }
 
+        // Write upgrade-safe circuit-breaker schema version marker (v1).
+        // Ensures future upgrades to circuit breaker storage layout are handled safely.
+        if !env.storage().instance().has(&DataKey::CircuitBreakerSchemaVersion) {
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerSchemaVersion, &1u32);
+            // Initialize circuit breaker admin to the authorized_payout_key (trusted backend)
+            error_recovery::set_circuit_admin(&env, authorized_payout_key.clone(), None);
+            // Initialize with default configuration
+            error_recovery::set_config(
+                &env,
+                error_recovery::CircuitBreakerConfig {
+                    failure_threshold: 3,
+                    success_threshold: 1,
+                    max_error_log: 10,
+                },
+            );
+            env.events().publish(
+                (symbol_short!("circuit"),),
+                (
+                    symbol_short!("cb_init"),
+                    env.ledger().timestamp(),
+                    1u32, // schema version
+                ),
+            );
+        }
+
         // Write upgrade-safe token-allowlist schema version marker.
         if !env
             .storage()

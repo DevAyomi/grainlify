@@ -663,6 +663,64 @@ pub enum ContractError {
     /// This error occurs when attempting to remove a token that is not
     /// present in the allowlist.
     TokenNotInAllowlist = 1102,
+
+    // =========================================================================
+    // Role Management Errors (1200-1299)
+    // =========================================================================
+
+    /// Admin rotation already in progress.
+    ///
+    /// This error occurs when attempting to start a new admin rotation
+    /// while another rotation is already pending.
+    AdminRotationInProgress = 1200,
+
+    /// No admin rotation in progress.
+    ///
+    /// This error occurs when attempting to accept or cancel an admin
+    /// rotation when no rotation is pending.
+    NoAdminRotationInProgress = 1201,
+
+    /// Invalid admin rotation state.
+    ///
+    /// This error occurs when admin rotation state is inconsistent
+    /// or corrupted.
+    InvalidAdminRotationState = 1202,
+
+    /// Controller rotation already in progress.
+    ///
+    /// This error occurs when attempting to start a new controller rotation
+    /// while another rotation is already pending for the same program.
+    ControllerRotationInProgress = 1203,
+
+    /// No controller rotation in progress.
+    ///
+    /// This error occurs when attempting to accept or cancel a controller
+    /// rotation when no rotation is pending.
+    NoControllerRotationInProgress = 1204,
+
+    /// Invalid controller rotation state.
+    ///
+    /// This error occurs when controller rotation state is inconsistent
+    /// or corrupted.
+    InvalidControllerRotationState = 1205,
+
+    /// Role transition period expired.
+    ///
+    /// This error occurs when attempting to complete a role rotation
+    /// after the allowed transition period has expired.
+    RoleTransitionExpired = 1206,
+
+    /// Invalid role proposal.
+    ///
+    /// This error occurs when the proposed role is invalid
+    /// (e.g., same as current, zero address, etc.).
+    InvalidRoleProposal = 1207,
+
+    /// Role rotation not allowed.
+    ///
+    /// This error occurs when role rotation is temporarily disabled
+    /// due to contract state (e.g., emergency mode, dispute, etc.).
+    RoleRotationNotAllowed = 1208,
 }
 
 /// Explicit error enum for all batch payout failure modes.
@@ -852,8 +910,19 @@ impl ContractError {
             // Token Allowlist Errors
             ContractError::TokenNotAllowed => "Token is not on the allowlist",
             ContractError::TokenAlreadyAllowed => "Token is already on the allowlist",
-            ContractError::TokenNotInAllowlist => "Token is not in the allowlist",
-
+            ContractError::TokenNotInAllowlist => "Token is not on the allowlist and cannot be removed",
+            
+            // Role Management Errors
+            ContractError::AdminRotationInProgress => "Admin rotation already in progress",
+            ContractError::NoAdminRotationInProgress => "No admin rotation in progress",
+            ContractError::InvalidAdminRotationState => "Invalid admin rotation state",
+            ContractError::ControllerRotationInProgress => "Controller rotation already in progress",
+            ContractError::NoControllerRotationInProgress => "No controller rotation in progress",
+            ContractError::InvalidControllerRotationState => "Invalid controller rotation state",
+            ContractError::RoleTransitionExpired => "Role transition period expired",
+            ContractError::InvalidRoleProposal => "Invalid role proposal",
+            ContractError::RoleRotationNotAllowed => "Role rotation not allowed",
+            
             // Release Trigger / Schedule Errors
             ContractError::ReleaseTriggerFailed => "Release trigger failed",
             ContractError::NoSchedulesDue => "No schedules are due for release",

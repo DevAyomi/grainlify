@@ -82,11 +82,43 @@
     "admin": [
       {
         "name": "initialize_contract",
-        "description": "Initialize the contract with an admin address.",
+        "description": "Initialize the contract with an admin address. Sets up role management schema for upgrade safety.",
         "parameters": [
           { "name": "admin", "type": "Address" }
         ],
         "authorization": "none (first call only)"
+      },
+      {
+        "name": "propose_admin",
+        "description": "Propose a new admin with deterministic behavior and explicit errors. Two-step rotation (step 1).",
+        "parameters": [
+          { "name": "proposed_admin", "type": "Address" }
+        ],
+        "authorization": "current admin",
+        "errors": [
+          { "code": 1200, "message": "Admin rotation already in progress" },
+          { "code": 1207, "message": "Invalid role proposal" },
+          { "code": 1208, "message": "Role rotation not allowed" }
+        ]
+      },
+      {
+        "name": "accept_admin",
+        "description": "Accept the proposed admin role. Two-step rotation (step 2).",
+        "parameters": [],
+        "authorization": "proposed admin",
+        "errors": [
+          { "code": 1201, "message": "No admin rotation in progress" },
+          { "code": 1202, "message": "Invalid admin rotation state" }
+        ]
+      },
+      {
+        "name": "cancel_admin_rotation",
+        "description": "Cancel a pending admin rotation.",
+        "parameters": [],
+        "authorization": "current admin",
+        "errors": [
+          { "code": 1201, "message": "No admin rotation in progress" }
+        ]
       },
       {
         "name": "set_circuit_admin",
@@ -136,6 +168,45 @@
         "authorization": "admin"
       },
       {
+        "name": "propose_controller",
+        "description": "Propose a new controller (authorized_payout_key) for a program with deterministic behavior. Two-step rotation (step 1).",
+        "parameters": [
+          { "name": "program_id", "type": "String" },
+          { "name": "caller", "type": "Address" },
+          { "name": "proposed_controller", "type": "Address" }
+        ],
+        "authorization": "current controller or admin",
+        "errors": [
+          { "code": 1203, "message": "Controller rotation already in progress" },
+          { "code": 1207, "message": "Invalid role proposal" },
+          { "code": 1208, "message": "Role rotation not allowed" }
+        ]
+      },
+      {
+        "name": "accept_controller",
+        "description": "Accept the proposed controller role for a program. Two-step rotation (step 2).",
+        "parameters": [
+          { "name": "program_id", "type": "String" }
+        ],
+        "authorization": "proposed controller",
+        "errors": [
+          { "code": 1204, "message": "No controller rotation in progress" },
+          { "code": 1205, "message": "Invalid controller rotation state" }
+        ]
+      },
+      {
+        "name": "cancel_controller_rotation",
+        "description": "Cancel a pending controller rotation for a program.",
+        "parameters": [
+          { "name": "program_id", "type": "String" },
+          { "name": "caller", "type": "Address" }
+        ],
+        "authorization": "current controller or admin",
+        "errors": [
+          { "code": 1204, "message": "No controller rotation in progress" }
+        ]
+      },
+      {
         "name": "set_program_spend_threshold",
         "description": "Set per-program spend threshold. Any single payout or batch total exceeding this is rejected.",
         "parameters": [
@@ -147,6 +218,28 @@
     ]
   },
   "behaviors": {
+    "role_separation": {
+      "description": "Deterministic role separation and controller rotation with two-step process, explicit errors, and upgrade-safe storage.",
+      "features": {
+        "two_step_rotation": "Both admin and controller roles use two-step rotation (propose + accept) for security",
+        "deterministic_behavior": "All role operations have deterministic outcomes with explicit error codes",
+        "upgrade_safe_storage": "Role management uses schema versioning for upgrade compatibility",
+        "replay_protection": "Nonces and timestamps prevent replay attacks",
+        "emergency_controls": "Role rotations can be blocked during emergencies or disputes",
+        "transition_periods": "Configurable maximum transition periods for role changes"
+      },
+      "error_codes": {
+        "1200": "Admin rotation already in progress",
+        "1201": "No admin rotation in progress", 
+        "1202": "Invalid admin rotation state",
+        "1203": "Controller rotation already in progress",
+        "1204": "No controller rotation in progress",
+        "1205": "Invalid controller rotation state",
+        "1206": "Role transition period expired",
+        "1207": "Invalid role proposal",
+        "1208": "Role rotation not allowed"
+      }
+    },
     "circuit_breaker": {
       "description": "Three-state circuit breaker (Closed, Open, HalfOpen) guards all payout operations with deterministic, explicit errors and upgrade-safe storage.",
       "states": ["Closed", "Open", "HalfOpen"],

@@ -130,7 +130,15 @@
     fn test_get_circuit_breaker_status_reflects_config() {
         let s = setup_with_funds(0);
         s.client
-            .configure_circuit_breaker(&son a fresh contract.
+            .configure_circuit_breaker(&s.admin, &7u32, &3u32, &20u32, &600u64);
+
+        let status = s.client.get_circuit_breaker_status();
+        assert_eq!(status.failure_threshold, 7);
+        assert_eq!(status.success_threshold, 3);
+        assert_eq!(status.recovery_window, 600);
+    }
+
+    /// get_circuit_breaker_status returns Closed with zero counts on a fresh contract.
     #[test]
     fn test_get_circuit_breaker_status_initial_state() {
         let s = setup_with_funds(0);

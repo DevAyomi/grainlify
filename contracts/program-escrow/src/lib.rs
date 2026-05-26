@@ -1468,6 +1468,8 @@ mod reentrancy_guard;
 // #[cfg(test)] mod error_recovery_tests; // pre-existing breakage
 #[cfg(any())] // pre-existing syntax error in file
 mod test_circuit_breaker_enforcement;
+#[cfg(test)]
+mod test_circuit_breaker_timeout;
 #[cfg(any())]
 mod reentrancy_tests;
 // #[cfg(test)] mod test_dispute_resolution; // pre-existing breakage
@@ -3768,6 +3770,7 @@ impl ProgramEscrowContract {
         failure_threshold: u32,
         success_threshold: u32,
         max_error_log: u32,
+        recovery_window: u64,
     ) {
         caller.require_auth();
         let admin = error_recovery::get_circuit_admin(&env).expect("Circuit admin not set");
@@ -3779,6 +3782,7 @@ impl ProgramEscrowContract {
             failure_threshold,
             success_threshold,
             max_error_log,
+            recovery_window,
         };
         error_recovery::set_config(&env, config);
     }

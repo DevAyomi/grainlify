@@ -262,6 +262,16 @@ pub struct FeeCollectedEvent {
     pub recipient: Address,
     pub timestamp: u64,
 }
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRecipientUpdatedEvent {
+    pub version: u32,
+    pub old_recipient: Address,
+    pub new_recipient: Address,
+    pub updated_by: Address,
+    pub timestamp: u64,
+}
+
 // ==================== MONITORING MODULE ====================
 mod monitoring {
     use soroban_sdk::{contracttype, Address, Env, String, Symbol};
@@ -2612,6 +2622,46 @@ impl ProgramEscrowContract {
         }
         env.storage().instance().set(&FEE_CONFIG, &cfg);
     }
+
+    /// Update fee recipient address (admin only). Emits audit event.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `new_recipient` - New address to receive fees
+    ///
+    /// # Panics
+    /// * If caller is not admin
+    /// * If new_recipient is invalid
+    ///
+    /// # Events
+    /// Emits FeeRecipientUpdatedEvent with old and new addresses for audit trail
+    pub fn update_fee_recipient(env: Env, new_recipient: Address) {
+        let admin = Self::require_admin(&env);
+        
+        // Validate new_recipient (ensure it's not zero)
+        if new_recipient.to_string() == "" {
+            panic!("Invalid fee recipient address");
+        }
+        
+        let mut cfg = Self::get_fee_config_internal(&env);
+        let old_recipient = cfg.fee_recipient.clone();
+        
+        cfg.fee_recipient = new_recipient.clone();
+        env.storage().instance().set(&FEE_CONFIG, &cfg);
+        
+        // Emit audit event
+        env.events().publish(
+            ("fee_recipient_updated",),
+            FeeRecipientUpdatedEvent {
+                version: 1,
+                old_recipient,
+                new_recipient,
+                updated_by: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
 
     /// Check if a program exists (legacy single-program check)
     ///

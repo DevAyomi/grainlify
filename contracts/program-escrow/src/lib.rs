@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 //! # Program Escrow Smart Contract (v2)
 //!
 //! Adds ProgramStatus::Draft and publish_program() to the lifecycle.

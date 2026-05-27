@@ -255,3 +255,99 @@ mod test_lifecycle {
         assert!(client.get_program(&pid(&env, "p-001")).unwrap().published_at.is_some());
     }
 }
+
+// ---------------------------------------------------------------------------
+// STATE: Draft - Refund Operations Blocked
+// Refund operations should fail when program is in Draft status.
+// ---------------------------------------------------------------------------
+
+/// cancel_claim should fail when program is in Draft status.
+#[test]
+#[should_panic(expected = "107")]
+fn test_cancel_claim_fails_on_draft_program() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (_token_client, token_id) = fund_contract(&env, &contract_id, 50_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "draft-prog");
+    
+    // Initialize program but do NOT publish - stays in Draft status
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+    
+    // Attempt to cancel a claim on Draft program should fail with ProgramNotActive (107)
+    client.cancel_claim(&program_id, 1, &admin);
+}
+
+/// emergency_withdraw should fail when program is in Draft status.
+#[test]
+#[should_panic(expected = "107")]
+fn test_emergency_withdraw_fails_on_draft_program() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (_token_client, token_id) = fund_contract(&env, &contract_id, 50_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "draft-prog");
+    
+    // Initialize program but do NOT publish - stays in Draft status
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+    
+    // Set lock_paused to true (required for emergency_withdraw)
+    client.set_pause_flags(&Some(true), &Some(false), &Some(false), &None);
+    
+    // Attempt emergency withdraw on Draft program should fail with ProgramNotActive (107)
+    let target = Address::generate(&env);
+    client.emergency_withdraw(&target);
+}
+
+/// cancel_claim should succeed when program is in Active status.
+#[test]
+fn test_cancel_claim_succeeds_on_active_program() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (_token_client, token_id) = fund_contract(&env, &contract_id, 50_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "active-prog");
+    
+    // Initialize and publish program - transitions to Active status
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+    client.publish_program(&program_id);
+    client.lock_program_funds(&50_000);
+    
+    // Create a claim first
+    let recipient = Address::generate(&env);
+    client.create_claim(&program_id, &recipient, &10_000, &86400);
+    
+    // Cancel claim should succeed on Active program
+    client.cancel_claim(&program_id, 1, &admin);
+}
+
+/// emergency_withdraw should succeed when program is in Active status.
+#[test]
+fn test_emergency_withdraw_succeeds_on_active_program() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (token_client, token_id) = fund_contract(&env, &contract_id, 50_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "active-prog");
+    
+    // Initialize and publish program - transitions to Active status
+    client.init_program(&program_id, &admin, &token_id, &admin, &None, &None);
+    client.publish_program(&program_id);
+    client.lock_program_funds(&50_000);
+    
+    // Set lock_paused to true (required for emergency_withdraw)
+    client.set_pause_flags(&Some(true), &Some(false), &Some(false), &None);
+    
+    // Emergency withdraw should succeed on Active program
+    let target = Address::generate(&env);
+    let initial_balance = token_client.balance(&target);
+    client.emergency_withdraw(&target);
+    let final_balance = token_client.balance(&target);
+    
+    // Target should have received the funds
+    assert_eq!(final_balance - initial_balance, 50_000);
+}

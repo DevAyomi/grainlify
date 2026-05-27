@@ -1,9 +1,9 @@
 {
   "$schema": "./contract-manifest-schema.json",
   "contract_name": "BountyEscrowContract",
-  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, participant filter pagination with audit events, and comprehensive security features including reentrancy protection and rate limiting",
+  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, participant filter pagination with audit events, high-value release timelock queue, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.4.0",
+    "current": "2.5.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -64,7 +64,34 @@
           "Added get_whitelist_count and get_blocklist_count view functions for O(1) total-count queries",
           "Added ParticipantFilterQueried audit event emitted on every query_whitelist/query_blocklist call for off-chain audit trails",
           "Limit argument silently capped at MAX_PARTICIPANT_FILTER_PAGE_SIZE (50) to bound per-call ledger cost",
-          "Added ParticipantListSchemaVersion storage key initialized on contract init for upgrade-safe storage versioning"
+          "Added ParticipantListSchemaVersion storage key initialized on contract init for upgrade-safe storage versioning",
+          "Added get_participant_schema_version view and ParticipantListSchemaVersionSet audit event for upgrade verification"
+        ]
+      },
+      {
+        "version": "2.5.0",
+        "release_date": "2026-04-24",
+        "changes": [
+          "Added high-value release timelock queue: releases at or above a configurable threshold are queued with a mandatory delay before execution",
+          "Added set_high_value_config (admin) to configure threshold and duration; both must be > 0",
+          "Added get_high_value_config view to read current configuration",
+          "Added get_queued_release view to inspect a pending queued release",
+          "Added execute_queued_release (permissionless after delay) to finalize a queued release; respects maintenance mode, escrow freeze, and applies release fees",
+          "Added cancel_queued_release (admin) to cancel a pending queued release",
+          "Added DataKey::HighValueConfig, DataKey::QueuedRelease(u64), and DataKey::HighValueConfigSchemaVersion storage keys",
+          "Added HighValueConfigUpdated, ReleaseQueued, QueuedReleaseExecuted, ReleaseQueueCancelled, and HighValueConfigSchemaVersionSet audit events",
+          "Added TimelockNotElapsed (53) and ReleaseAlreadyQueued (54) error codes",
+          "Added get_high_value_config_schema_version view for upgrade safety checks"
+        ]
+      },
+      {
+        "version": "2.6.0",
+        "release_date": "2026-04-27",
+        "changes": [
+          "Issue #1032: reinforced fee routing invariants with explicit status-transition coverage for invalid share sums and exact fee split accounting",
+          "Issue #1036: validated runtime batch size cap semantics in status-transition suite to protect independent lock/release limits",
+          "Issue #1039: added participant filter pagination status-transition coverage for deterministic total/offset/has_more semantics and hard page-size cap behavior",
+          "Preserved upgrade-safe storage semantics for FeeRoutingSchemaVersion, BatchSizeCaps, and ParticipantListSchemaVersion"
         ]
       }
     ]
@@ -381,6 +408,18 @@
         "gas_estimate": "low"
       },
       {
+        "name": "get_participant_schema_version",
+        "description": "Return participant list storage schema version initialized during init()",
+        "parameters": [],
+        "returns": {
+          "type": "u32",
+          "description": "Participant list storage schema version; 1 for the current whitelist/blocklist index layout"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
         "name": "query_whitelist",
         "description": "Get paginated allowlist participants with total count and has_more metadata. Limit silently capped at 50.",
         "parameters": [
@@ -481,6 +520,36 @@
         "returns": {
           "type": "BatchSizeCaps",
           "description": "Current effective batch size cap configuration"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_high_value_config",
+        "description": "Get the current high-value release timelock configuration, or None if not set.",
+        "parameters": [],
+        "returns": {
+          "type": "Option<HighValueConfig>",
+          "description": "Timelock threshold and duration, or None."
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_queued_release",
+        "description": "Get the pending queued release for a bounty, or None if no release is queued.",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          }
+        ],
+        "returns": {
+          "type": "Option<QueuedRelease>",
+          "description": "Queued release entry (contributor, amount, executable_at), or None."
         },
         "authorization": "any",
         "pausable": false,
@@ -597,6 +666,18 @@
         "returns": {
           "type": "RefundEligibilityView",
           "description": "Eligibility state with explicit semantic code and preview fields"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_refund_schema_version",
+        "description": "Return the upgrade-safe schema marker for refund eligibility view semantics",
+        "parameters": [],
+        "returns": {
+          "type": "u32",
+          "description": "Refund eligibility schema version, or 0 for legacy deployments without the marker"
         },
         "authorization": "any",
         "pausable": false,
@@ -891,7 +972,133 @@
           {
             "name": "new_flags",
             "type": "u32",
-            "description": "New bitmask of risk flags"
+            "description": "New bitmask of risk flags (bits outside RISK_FLAG_MASK_ALL are rejected)"
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "set_escrow_risk_flags",
+        "description": "OR flag_bits onto stored risk flags for a bounty (admin only). Returns updated EscrowMetadata.",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier (metadata created with zero defaults if absent)"
+          },
+          {
+            "name": "flag_bits",
+            "type": "u32",
+            "description": "Bits to set; rejected if outside RISK_FLAG_MASK_ALL"
+          }
+        ],
+        "returns": {
+          "type": "EscrowMetadata",
+          "description": "Updated metadata reflecting new flag state"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "clear_escrow_risk_flags",
+        "description": "AND-NOT flag_bits from stored risk flags for a bounty (admin only). Returns updated EscrowMetadata.",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          },
+          {
+            "name": "flag_bits",
+            "type": "u32",
+            "description": "Bits to clear; rejected if outside RISK_FLAG_MASK_ALL"
+          }
+        ],
+        "returns": {
+          "type": "EscrowMetadata",
+          "description": "Updated metadata reflecting new flag state"
+        },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "update_metadata",
+        "description": "Write repo_id, issue_id, bounty_type, and reference_hash for a bounty. Caller must be admin or a registered governor. Preserves risk_flags and notification_prefs.",
+        "parameters": [
+          {
+            "name": "caller",
+            "type": "Address",
+            "description": "Address performing the update; must be admin or governor"
+          },
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          },
+          {
+            "name": "repo_id",
+            "type": "u64",
+            "description": "Repository identifier"
+          },
+          {
+            "name": "issue_id",
+            "type": "u64",
+            "description": "Issue identifier"
+          },
+          {
+            "name": "bounty_type",
+            "type": "String",
+            "description": "Bounty type tag (max 50 chars)"
+          },
+          {
+            "name": "reference_hash",
+            "type": "Option<Bytes>",
+            "description": "Optional content-addressed reference hash",
+            "optional": true
+          }
+        ],
+        "returns": {
+          "type": "()",
+          "description": "Empty on success"
+        },
+        "authorization": "admin-or-governor",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_metadata",
+        "description": "Returns full EscrowMetadata for a bounty; zeroed defaults when absent",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          }
+        ],
+        "returns": {
+          "type": "EscrowMetadata",
+          "description": "Full metadata record"
+        },
+        "authorization": "none",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "add_risk_governor",
+        "description": "Adds an address to the risk-flag governor list (admin only, max 16 entries)",
+        "parameters": [
+          {
+            "name": "governor",
+            "type": "Address",
+            "description": "Address to authorize for risk-flag mutations"
           }
         ],
         "returns": {
@@ -1047,6 +1254,56 @@
         "authorization": "admin",
         "pausable": false,
         "gas_estimate": "low"
+      },
+      {
+        "name": "set_high_value_config",
+        "description": "Configure the high-value release timelock. Releases at or above threshold are queued for duration seconds before execution. Emits HighValueConfigUpdated.",
+        "parameters": [
+          {
+            "name": "threshold",
+            "type": "i128",
+            "description": "Minimum amount (inclusive) that triggers the timelock queue. Must be > 0."
+          },
+          {
+            "name": "duration",
+            "type": "u64",
+            "description": "Delay in seconds before a queued release becomes executable. Must be > 0."
+          }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "cancel_queued_release",
+        "description": "Cancel a pending queued high-value release. The escrow remains Locked. Emits ReleaseQueueCancelled.",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty whose queued release should be cancelled."
+          }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "execute_queued_release",
+        "description": "Execute a queued high-value release once its timelock has elapsed. Permissionless — anyone may call after executable_at. Respects maintenance mode and release pause flags. Respects escrow freeze and contributor address freeze. Applies release fees consistently with release_funds. Emits QueuedReleaseExecuted.",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty whose queued release should be executed."
+          }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "any",
+        "pausable": true,
+        "gas_estimate": "medium"
       }
     ]
   },
@@ -1252,7 +1509,25 @@
       {
         "name": "ParticipantListSchemaVersion",
         "type": "instance",
-        "description": "Upgrade-safe marker for participant list (whitelist/blocklist) storage semantics. Initialized to 1 during init().",
+        "description": "Upgrade-safe marker for participant list (whitelist/blocklist) storage semantics. Initialized to 1 during init(), exposed through get_participant_schema_version, and audited through ParticipantListSchemaVersionSet.",
+        "data_structure": "u32"
+      },
+      {
+        "name": "HighValueConfig",
+        "type": "instance",
+        "description": "High-value release timelock configuration (threshold and duration). When set, releases at or above threshold are queued.",
+        "data_structure": "HighValueConfig"
+      },
+      {
+        "name": "QueuedRelease",
+        "type": "persistent",
+        "description": "Per-bounty queued release entry awaiting timelock expiry. Keyed by bounty_id.",
+        "data_structure": "QueuedRelease"
+      },
+      {
+        "name": "HighValueConfigSchemaVersion",
+        "type": "instance",
+        "description": "Upgrade-safe schema marker for high-value timelock config storage layout. Initialized to 1 during init(). Increment when HighValueConfig or QueuedRelease layout changes.",
         "data_structure": "u32"
       }
     ]
@@ -1683,6 +1958,33 @@
           }
         ],
         "trigger": "Every call to query_whitelist or query_blocklist"
+      },
+      {
+        "name": "ParticipantListSchemaVersionSet",
+        "description": "Emitted during init() when the participant list schema version marker is written",
+        "data": [
+          {
+            "name": "version",
+            "type": "u32",
+            "description": "Event payload schema version"
+          },
+          {
+            "name": "schema_version",
+            "type": "u32",
+            "description": "Participant list storage schema version"
+          },
+          {
+            "name": "set_by",
+            "type": "Address",
+            "description": "Admin that initialized the contract"
+          },
+          {
+            "name": "timestamp",
+            "type": "u64",
+            "description": "Ledger timestamp"
+          }
+        ],
+        "trigger": "Contract init()"
       }
     ]
   },

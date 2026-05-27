@@ -124,6 +124,23 @@ fn authorize_contract_call(
     }]);
 }
 
+fn has_event_topic(env: &Env, topic: &str) -> bool {
+    let expected = Symbol::new(env, topic);
+    env.events().all().iter().any(|(_, topics, _)| {
+        topics.len() >= 1
+            && topics
+                .get(0)
+                .and_then(|t| {
+                    <Symbol as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(
+                        env, &t,
+                    )
+                    .ok()
+                })
+                .map(|s| s == expected)
+                .unwrap_or(false)
+    })
+}
+
 #[test]
 fn test_refund_eligibility_ineligible_before_deadline_without_approval() {
     let setup = TestSetup::new();
@@ -186,6 +203,157 @@ fn test_refund_eligibility_eligible_with_admin_approval_before_deadline() {
     assert_eq!(view.amount, 500);
     assert_eq!(view.recipient, Some(custom_recipient));
     assert!(view.approval_present);
+}
+
+#[test]
+fn test_refund_eligibility_view_reports_not_found_without_auth() {
+    let setup = TestSetup::new();
+    let view = setup.escrow.get_refund_eligibility_view(&404_u64);
+
+    assert!(!view.eligible);
+    assert_eq!(view.code, RefundEligibilityCode::IneligibleBountyNotFound);
+    assert_eq!(view.bounty_id, 404);
+    assert_eq!(view.amount, 0);
+    assert_eq!(view.deadline, 0);
+    assert_eq!(view.recipient, None);
+    assert!(!view.approval_present);
+}
+
+#[test]
+fn test_refund_eligibility_view_reports_invalid_status_after_release() {
+    let setup = TestSetup::new();
+    let bounty_id = 102;
+    let amount = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 500;
+
+    setup
+        .escrow
+        .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    let view = setup.escrow.get_refund_eligibility_view(&bounty_id);
+    assert!(!view.eligible);
+    assert_eq!(view.code, RefundEligibilityCode::IneligibleInvalidStatus);
+    assert_eq!(view.deadline, deadline);
+    assert_eq!(view.amount, 0);
+}
+
+#[test]
+fn test_refund_eligibility_schema_version_is_initialized() {
+    let setup = TestSetup::new();
+    assert_eq!(setup.escrow.get_refund_schema_version(), 1);
+}
+
+#[test]
+fn test_participant_filter_schema_version_is_initialized_and_audited() {
+    let setup = TestSetup::new();
+
+    assert_eq!(setup.escrow.get_participant_schema_version(), 1);
+    assert!(has_event_topic(&setup.env, "pf_schema"));
+}
+
+#[test]
+fn test_participant_filter_whitelist_pagination_counts_and_has_more() {
+    let setup = TestSetup::new();
+    let first = Address::generate(&setup.env);
+    let second = Address::generate(&setup.env);
+    let third = Address::generate(&setup.env);
+
+    setup.escrow.set_whitelist_entry(&first, &true);
+    setup.escrow.set_whitelist_entry(&second, &true);
+    setup.escrow.set_whitelist_entry(&third, &true);
+    setup.escrow.set_whitelist_entry(&first, &true);
+
+    assert_eq!(setup.escrow.get_whitelist_count(), 3);
+
+    let page1 = setup.escrow.query_whitelist(&0, &2);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.total, 3);
+    assert_eq!(page1.offset, 0);
+    assert!(page1.has_more);
+
+    let page2 = setup.escrow.query_whitelist(&2, &2);
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.total, 3);
+    assert_eq!(page2.offset, 2);
+    assert!(!page2.has_more);
+    assert!(has_event_topic(&setup.env, "pf_query"));
+}
+
+#[test]
+fn test_participant_filter_pagination_caps_limit_and_handles_extreme_offsets() {
+    let setup = TestSetup::new();
+
+    for _ in 0..55 {
+        let address = Address::generate(&setup.env);
+        setup.escrow.set_whitelist_entry(&address, &true);
+    }
+
+    let capped = setup.escrow.query_whitelist(&0, &999);
+    assert_eq!(capped.items.len(), 50);
+    assert_eq!(capped.total, 55);
+    assert!(capped.has_more);
+
+    let empty = setup.escrow.query_whitelist(&u32::MAX, &10);
+    assert_eq!(empty.items.len(), 0);
+    assert_eq!(empty.total, 55);
+    assert_eq!(empty.offset, u32::MAX);
+    assert!(!empty.has_more);
+
+    let zero_limit = setup.escrow.query_whitelist(&0, &0);
+    assert_eq!(zero_limit.items.len(), 0);
+    assert_eq!(zero_limit.total, 55);
+    assert!(zero_limit.has_more);
+}
+
+#[test]
+fn test_participant_filter_blocklist_pagination_removal_and_audit_event() {
+    let setup = TestSetup::new();
+    let first = Address::generate(&setup.env);
+    let second = Address::generate(&setup.env);
+
+    setup.escrow.set_blocklist_entry(&first, &true);
+    setup.escrow.set_blocklist_entry(&second, &true);
+    setup.escrow.set_blocklist_entry(&first, &false);
+
+    assert_eq!(setup.escrow.get_blocklist_count(), 1);
+
+    let page = setup.escrow.query_blocklist(&0, &10);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.total, 1);
+    assert!(!page.has_more);
+    assert!(has_event_topic(&setup.env, "pf_query"));
+}
+
+#[test]
+fn test_refund_approval_audit_events_and_consumption() {
+    let setup = TestSetup::new();
+    let bounty_id = 103;
+    let amount = 1_500;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    setup
+        .escrow
+        .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup
+        .escrow
+        .approve_refund(&bounty_id, &600, &setup.depositor, &RefundMode::Partial);
+    assert!(has_event_topic(&setup.env, "r_appr"));
+
+    setup.escrow.refund(&bounty_id);
+    assert!(has_event_topic(&setup.env, "r_apcns"));
+
+    let view = setup.escrow.get_refund_eligibility_view(&bounty_id);
+    assert!(!view.eligible);
+    assert_eq!(
+        view.code,
+        RefundEligibilityCode::IneligibleDeadlineNotPassed
+    );
+    assert_eq!(view.amount, 0);
+    assert!(!view.approval_present);
+
+    let legacy = setup.escrow.get_refund_eligibility(&bounty_id);
+    assert_eq!(legacy.3, None);
 }
 
 /// Maintenance mode halts ALL state-mutating operations globally (lock, release, refund).
@@ -322,7 +490,7 @@ fn test_partially_refunded_to_refunded() {
 
 // Invalid transition: Released → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #201)")]
+#[should_panic(expected = "Error(Contract, #55)")]
 fn test_released_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -341,7 +509,7 @@ fn test_released_to_locked_fails() {
 
 // Invalid transition: Released → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_released_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -358,7 +526,7 @@ fn test_released_to_released_fails() {
 
 // Invalid transition: Released → Refunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_released_to_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -376,7 +544,7 @@ fn test_released_to_refunded_fails() {
 
 // Invalid transition: Released → PartiallyRefunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_released_to_partially_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -396,7 +564,7 @@ fn test_released_to_partially_refunded_fails() {
 
 // Invalid transition: Refunded → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #201)")]
+#[should_panic(expected = "Error(Contract, #55)")]
 fn test_refunded_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -425,7 +593,7 @@ fn test_refunded_to_locked_fails() {
 
 // Invalid transition: Refunded → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_refunded_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -452,7 +620,7 @@ fn test_refunded_to_released_fails() {
 
 // Invalid transition: Refunded → Refunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_refunded_to_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -479,7 +647,7 @@ fn test_refunded_to_refunded_fails() {
 
 // Invalid transition: Refunded → PartiallyRefunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_refunded_to_partially_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -508,7 +676,7 @@ fn test_refunded_to_partially_refunded_fails() {
 
 // Invalid transition: PartiallyRefunded → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #201)")]
+#[should_panic(expected = "Error(Contract, #55)")]
 fn test_partially_refunded_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -530,7 +698,7 @@ fn test_partially_refunded_to_locked_fails() {
 
 // Invalid transition: PartiallyRefunded → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_partially_refunded_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -578,7 +746,7 @@ fn test_update_risk_flags_success() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #202)")]
+#[should_panic(expected = "Error(Contract, #56)")]
 fn test_update_risk_flags_bounty_not_found() {
     let setup = TestSetup::new();
     let missing_bounty_id = 999;
@@ -588,7 +756,7 @@ fn test_update_risk_flags_bounty_not_found() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #202)")]
+#[should_panic(expected = "Error(Contract, #56)")]
 fn test_get_risk_flags_bounty_not_found() {
     let setup = TestSetup::new();
     let missing_bounty_id = 999;
@@ -1025,17 +1193,10 @@ fn test_set_batch_size_caps_success() {
 fn test_set_batch_size_caps_emits_event() {
     let setup = TestSetup::new();
     setup.escrow.set_batch_size_caps(&4_u32, &2_u32);
-    let events = setup.env.events().all();
-    let found = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1
-            && topics
-                .get(0)
-                .map(|t| {
-                    t == soroban_sdk::Symbol::new(&setup.env, "bcapcfg").into_val(&setup.env)
-                })
-                .unwrap_or(false)
-    });
-    assert!(found, "BatchSizeCapsUpdated event not emitted");
+    assert!(
+        has_event_topic(&setup.env, "bcapcfg"),
+        "BatchSizeCapsUpdated event not emitted"
+    );
 }
 
 // --- set_batch_size_caps: boundary values ---
@@ -1201,4 +1362,490 @@ fn test_batch_size_caps_persist_in_storage() {
     let caps = setup.escrow.get_batch_size_caps();
     assert_eq!(caps.lock_cap, 7);
     assert_eq!(caps.release_cap, 3);
+}
+
+// ============================================================================
+// HIGH-VALUE RELEASE TIMELOCK QUEUE TESTS
+// ============================================================================
+
+#[test]
+fn test_set_high_value_config_stores_correctly() {
+    let setup = TestSetup::new();
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+
+    let cfg = setup.escrow.get_high_value_config().unwrap();
+    assert_eq!(cfg.threshold, threshold);
+    assert_eq!(cfg.duration, duration);
+}
+
+#[test]
+fn test_set_high_value_config_zero_threshold_rejected() {
+    let setup = TestSetup::new();
+    let res = setup.escrow.try_set_high_value_config(&0, &3_600);
+    assert!(matches!(res, Err(Ok(Error::InvalidAmount))));
+}
+
+#[test]
+fn test_release_below_threshold_executes_immediately() {
+    let setup = TestSetup::new();
+    let bounty_id = 900;
+    let amount: i128 = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    // Threshold is 5_000 — amount is below it.
+    setup.escrow.set_high_value_config(&5_000, &3_600);
+    setup.token_admin.mint(&setup.depositor, &amount);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Should be Released immediately (no queue).
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Released
+    );
+    assert!(setup.escrow.get_queued_release(&bounty_id).is_none());
+}
+
+#[test]
+fn test_release_at_threshold_queues_release() {
+    let setup = TestSetup::new();
+    let bounty_id = 901;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+
+    let now = setup.env.ledger().timestamp();
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Escrow should still be Locked (queued, not released).
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Locked
+    );
+
+    let queued = setup.escrow.get_queued_release(&bounty_id).unwrap();
+    assert_eq!(queued.contributor, setup.contributor);
+    assert_eq!(queued.amount, threshold);
+    assert_eq!(queued.executable_at, now + duration);
+}
+
+#[test]
+fn test_execute_queued_release_before_timelock_fails() {
+    let setup = TestSetup::new();
+    let bounty_id = 902;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Try to execute before timelock elapses.
+    let res = setup.escrow.try_execute_queued_release(&bounty_id);
+    assert!(matches!(res, Err(Ok(Error::TimelockNotElapsed))));
+}
+
+#[test]
+fn test_execute_queued_release_after_timelock_succeeds() {
+    let setup = TestSetup::new();
+    let bounty_id = 903;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Advance time past the timelock.
+    setup.env.ledger().set_timestamp(setup.env.ledger().timestamp() + duration + 1);
+    setup.escrow.execute_queued_release(&bounty_id);
+
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Released
+    );
+    assert!(setup.escrow.get_queued_release(&bounty_id).is_none());
+}
+
+#[test]
+fn test_execute_queued_release_at_exact_boundary_succeeds() {
+    let setup = TestSetup::new();
+    let bounty_id = 904;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let start = setup.env.ledger().timestamp();
+    let deadline = start + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Advance to exactly executable_at.
+    setup.env.ledger().set_timestamp(start + duration);
+    setup.escrow.execute_queued_release(&bounty_id);
+
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Released
+    );
+}
+
+#[test]
+fn test_double_queue_same_bounty_rejected() {
+    let setup = TestSetup::new();
+    let bounty_id = 905;
+    let threshold: i128 = 5_000;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &3_600);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Second call should fail with ReleaseAlreadyQueued.
+    let res = setup.escrow.try_release_funds(&bounty_id, &setup.contributor);
+    assert!(matches!(res, Err(Ok(Error::ReleaseAlreadyQueued))));
+}
+
+#[test]
+fn test_cancel_queued_release_restores_locked_state() {
+    let setup = TestSetup::new();
+    let bounty_id = 906;
+    let threshold: i128 = 5_000;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &3_600);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Cancel the queued release.
+    setup.escrow.cancel_queued_release(&bounty_id);
+
+    // Queue entry should be gone; escrow still Locked.
+    assert!(setup.escrow.get_queued_release(&bounty_id).is_none());
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Locked
+    );
+}
+
+#[test]
+fn test_cancel_queued_release_allows_re_queue() {
+    let setup = TestSetup::new();
+    let bounty_id = 907;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Cancel, then queue again.
+    setup.escrow.cancel_queued_release(&bounty_id);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    assert!(setup.escrow.get_queued_release(&bounty_id).is_some());
+}
+
+#[test]
+fn test_execute_nonexistent_queued_release_fails() {
+    let setup = TestSetup::new();
+    let res = setup.escrow.try_execute_queued_release(&9999);
+    assert!(matches!(res, Err(Ok(Error::BountyNotFound))));
+}
+
+#[test]
+fn test_cancel_nonexistent_queued_release_fails() {
+    let setup = TestSetup::new();
+    let res = setup.escrow.try_cancel_queued_release(&9999);
+    assert!(matches!(res, Err(Ok(Error::BountyNotFound))));
+}
+
+#[test]
+fn test_get_queued_release_returns_none_when_not_queued() {
+    let setup = TestSetup::new();
+    let bounty_id = 908;
+    let amount: i128 = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    setup.token_admin.mint(&setup.depositor, &amount);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    assert!(setup.escrow.get_queued_release(&bounty_id).is_none());
+}
+
+#[test]
+fn test_high_value_config_not_set_releases_immediately() {
+    let setup = TestSetup::new();
+    let bounty_id = 909;
+    let amount: i128 = 999_999;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    // No high-value config set — any amount releases immediately.
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Released
+    );
+}
+
+#[test]
+fn test_set_high_value_config_zero_duration_rejected() {
+    let setup = TestSetup::new();
+    // duration == 0 would defeat the timelock entirely; must be rejected.
+    let res = setup.escrow.try_set_high_value_config(&5_000, &0);
+    assert!(matches!(res, Err(Ok(Error::InvalidAmount))));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_execute_queued_release_respects_maintenance_mode() {
+    let setup = TestSetup::new();
+    let bounty_id = 910;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Advance past the timelock then engage maintenance mode.
+    setup.env.ledger().set_timestamp(setup.env.ledger().timestamp() + duration + 1);
+    setup.escrow.set_maintenance_mode(&true, &None);
+
+    // Should panic with FundsPaused (18).
+    setup.escrow.execute_queued_release(&bounty_id);
+}
+
+#[test]
+fn test_execute_queued_release_respects_escrow_freeze() {
+    let setup = TestSetup::new();
+    let bounty_id = 911;
+    let threshold: i128 = 5_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Freeze the escrow while the release is queued.
+    setup.escrow.freeze_escrow(&bounty_id, &None);
+
+    // Advance past the timelock.
+    setup.env.ledger().set_timestamp(setup.env.ledger().timestamp() + duration + 1);
+
+    // Execute should be blocked by the freeze.
+    let res = setup.escrow.try_execute_queued_release(&bounty_id);
+    assert!(matches!(res, Err(Ok(Error::EscrowFrozen))));
+}
+
+#[test]
+fn test_high_value_config_schema_version_set_on_init() {
+    let setup = TestSetup::new();
+    // Schema version must be written during init() for upgrade-safe semantics.
+    assert_eq!(setup.escrow.get_hv_config_schema_version(), 1);
+}
+
+#[test]
+fn test_execute_queued_release_applies_release_fee() {
+    let setup = TestSetup::new();
+    let bounty_id = 912;
+    let threshold: i128 = 10_000;
+    let duration: u64 = 3_600;
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+
+    // Configure a 10% (1_000 bps) release fee routed to the admin.
+    setup.escrow.update_fee_config(
+        &None,
+        &Some(1_000_i128), // release_fee_rate (10%)
+        &None,
+        &None,
+        &Some(setup.admin.clone()),
+        &Some(true),
+    );
+
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    setup.token_admin.mint(&setup.depositor, &threshold);
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &threshold, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Advance past the timelock.
+    setup.env.ledger().set_timestamp(setup.env.ledger().timestamp() + duration + 1);
+    setup.escrow.execute_queued_release(&bounty_id);
+
+    // Contributor should receive net (90% of threshold = 9_000).
+    let contributor_balance = setup.token.balance(&setup.contributor);
+    assert_eq!(contributor_balance, 9_000);
+
+    // Admin should receive the fee (10% of threshold = 1_000).
+    let admin_balance = setup.token.balance(&setup.admin);
+    assert_eq!(admin_balance, 1_000);
+
+    assert_eq!(
+        setup.escrow.get_escrow_info(&bounty_id).status,
+        EscrowStatus::Released
+    );
+}
+
+// ============================================================================
+// CEI + Reentrancy Guard Hardening Tests — Issue #1024 / #32
+//
+// Security model:
+//   - Every state-mutating function acquires the guard before any check
+//   - Guard is released on EVERY exit path (success and error)
+//   - State writes (effects) happen before token transfers (interactions)
+//   - Early-return error paths do not leave the guard permanently set
+// ============================================================================
+
+/// CEI-01: lock_funds follows CEI — state is written before token transfer.
+/// Verifies escrow status is Locked after a successful lock.
+#[test]
+fn test_cei_lock_funds_state_written_before_transfer() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 1;
+    let amount: i128 = 10_000;
+    let deadline = setup.env.ledger().timestamp() + 86_400;
+
+    setup.escrow.lock_funds(
+        &setup.depositor,
+        &bounty_id,
+        &amount,
+        &deadline,
+    );
+
+    let escrow = setup.escrow.get_escrow_info(&bounty_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+    assert_eq!(escrow.amount, amount);
+}
+
+/// CEI-02: release_funds follows CEI — status set to Released before transfer.
+#[test]
+fn test_cei_release_funds_status_updated_before_transfer() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 2;
+    let amount: i128 = 5_000;
+    let deadline = setup.env.ledger().timestamp() + 86_400;
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    let escrow = setup.escrow.get_escrow_info(&bounty_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(setup.token.balance(&setup.contributor), amount);
+}
+
+/// CEI-03: refund follows CEI — status set to Refunded before transfer.
+#[test]
+fn test_cei_refund_status_updated_before_transfer() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 3;
+    let amount: i128 = 3_000;
+    // Set deadline in the past so refund is allowed without approval
+    setup.env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let deadline = 500u64; // already passed
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.refund(&bounty_id);
+
+    let escrow = setup.escrow.get_escrow_info(&bounty_id);
+    assert_eq!(escrow.status, EscrowStatus::Refunded);
+    assert_eq!(setup.token.balance(&setup.depositor), 1_000_000); // full balance restored
+}
+
+/// CEI-04: Reentrancy guard is NOT active after a successful lock_funds.
+/// Verifies the guard is properly released on the success path.
+#[test]
+fn test_reentrancy_guard_released_after_lock_funds() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 10;
+    let amount: i128 = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 86_400;
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    // A second lock on a different bounty_id must succeed — guard was released
+    let bounty_id2: u64 = 11;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id2, &amount, &deadline);
+    assert_eq!(setup.escrow.get_escrow_info(&bounty_id2).status, EscrowStatus::Locked);
+}
+
+/// CEI-05: Reentrancy guard is NOT active after a successful release_funds.
+#[test]
+fn test_reentrancy_guard_released_after_release_funds() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 20;
+    let amount: i128 = 2_000;
+    let deadline = setup.env.ledger().timestamp() + 86_400;
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    // Another lock must succeed — guard was released
+    let bounty_id2: u64 = 21;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id2, &amount, &deadline);
+    assert_eq!(setup.escrow.get_escrow_info(&bounty_id2).status, EscrowStatus::Locked);
+}
+
+/// CEI-06: Error path releases guard — a failed lock does not block subsequent calls.
+#[test]
+fn test_reentrancy_guard_released_on_error_path() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 30;
+    let amount: i128 = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 86_400;
+
+    // First lock succeeds
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+
+    // Second lock on same bounty_id fails (BountyExists) — guard must be released
+    let result = setup.escrow.try_lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    assert!(result.is_err(), "duplicate bounty_id must fail");
+
+    // Third lock on a new bounty_id must succeed — guard was released on error path
+    let bounty_id2: u64 = 31;
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id2, &amount, &deadline);
+    assert_eq!(setup.escrow.get_escrow_info(&bounty_id2).status, EscrowStatus::Locked);
+}
+
+/// CEI-07: Paused release returns error and guard is released — next call works.
+#[test]
+fn test_reentrancy_guard_released_when_paused() {
+    let setup = TestSetup::new();
+    let bounty_id: u64 = 40;
+    let amount: i128 = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 86_400;
+
+    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.set_paused(&Some(false), &Some(true), &None, &None);
+
+    // Release is paused — must fail
+    let result = setup.escrow.try_release_funds(&bounty_id, &setup.contributor);
+    assert!(result.is_err(), "release must fail when paused");
+
+    // Unpause and retry — guard must have been released
+    setup.escrow.set_paused(&None, &Some(false), &None, &None);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+    assert_eq!(setup.escrow.get_escrow_info(&bounty_id).status, EscrowStatus::Released);
 }

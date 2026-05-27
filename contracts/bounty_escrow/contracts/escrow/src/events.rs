@@ -94,7 +94,7 @@ pub fn emit_bounty_initialized(env: &Env, event: BountyEscrowInitialized) {
 
 pub fn emit_admin_proposed(e: &Env, old: Address, new: Address) {
     e.events().publish(
-        (symbol_short!("admin_prop"),),
+        (symbol_short!("adm_prop"),),
         (old, new),
     );
 }
@@ -106,9 +106,9 @@ pub fn emit_admin_transferred(e: &Env, old: Address, new: Address) {
     );
 }
 
-pub fn emit_admin_transfer_cancelled(e: &Env, admin: Address) {
+pub fn emit_admin_transfer_cancelled_v1(e: &Env, admin: Address) {
     e.events().publish(
-        (symbol_short!("admin_cancel"),),
+        (symbol_short!("adm_cncl2"),),
         (admin,),
     );
 }
@@ -999,6 +999,35 @@ pub fn emit_participant_filter_queried(env: &Env, event: ParticipantFilterQuerie
     env.events().publish(topics, event);
 }
 
+/// Emitted once during `init()` to record the participant list storage schema
+/// version. This covers the allowlist/blocklist index layout used by the
+/// paginated participant filter views.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"pf_schema"` |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantListSchemaVersionSet {
+    pub version: u32,
+    /// Participant list schema version written to instance storage.
+    pub schema_version: u32,
+    /// Admin that initialized the contract.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emit [`ParticipantListSchemaVersionSet`].
+pub fn emit_participant_list_schema_version_set(
+    env: &Env,
+    event: ParticipantListSchemaVersionSet,
+) {
+    let topics = (symbol_short!("pf_schema"),);
+    env.events().publish(topics, event);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // RISK FLAG EVENTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1881,6 +1910,38 @@ pub fn emit_release_queue_cancelled(env: &Env, event: ReleaseQueueCancelled) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-VALUE CONFIG SCHEMA VERSION EVENT (upgrade-safe marker)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Emitted once during `init()` to record the high-value timelock config storage
+/// schema version. Enables upgrade safety checks to detect schema mismatches
+/// when the `HighValueConfig` layout changes.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"hv_schm"` |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HighValueConfigSchemaVersionSet {
+    pub version: u32,
+    /// Schema version written to instance storage.
+    pub schema_version: u32,
+    /// Admin that initialized the contract.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+pub fn emit_high_value_config_schema_version_set(
+    env: &Env,
+    event: HighValueConfigSchemaVersionSet,
+) {
+    let topics = (symbol_short!("hv_schm"),);
+    env.events().publish(topics, event);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CLAIM-WINDOW EVENTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1889,7 +1950,7 @@ pub fn emit_release_queue_cancelled(env: &Env, event: ReleaseQueueCancelled) {
 /// ### Topics
 /// | Index | Value |
 /// |-------|-------|
-/// | 0 | `"clm_win"` |
+/// | 0 | `"clm_set"` |
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimWindowSet {
@@ -1903,7 +1964,7 @@ pub struct ClaimWindowSet {
 }
 
 pub fn emit_claim_window_set(env: &Env, event: ClaimWindowSet) {
-    let topics = (symbol_short!("clm_win"),);
+    let topics = (symbol_short!("clm_set"),);
     env.events().publish(topics, event);
 }
 
@@ -1950,5 +2011,40 @@ pub struct ClaimWindowExpired {
 
 pub fn emit_claim_window_expired(env: &Env, event: ClaimWindowExpired) {
     let topics = (symbol_short!("clm_exp"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+// ============================================================================
+// Maintenance Mode Schema Version Event — CEI + Reentrancy Guard Hardening
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceModeSchemaVersionSet {
+    pub version: u32,
+    pub schema_version: u32,
+    pub set_by: soroban_sdk::Address,
+    pub timestamp: u64,
+}
+
+pub fn emit_maintenance_mode_schema_version_set(env: &Env, event: MaintenanceModeSchemaVersionSet) {
+    let topics = (symbol_short!("mm_schema"),);
+    env.events().publish(topics, event);
+}
+
+// ============================================================================
+// Reentrancy Guard Audit Event — emitted when guard is acquired/released
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReentrancyGuardAcquired {
+    pub version: u32,
+    pub function: soroban_sdk::Symbol,
+    pub timestamp: u64,
+}
+
+pub fn emit_reentrancy_guard_acquired(env: &Env, event: ReentrancyGuardAcquired) {
+    let topics = (symbol_short!("rg_acq"),);
     env.events().publish(topics, event);
 }

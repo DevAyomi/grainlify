@@ -1,40 +1,41 @@
 #![cfg(test)]
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
+use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 #[test]
 fn test_registry_workflow() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, GrainlifyRegistry);
-    let client = GrainlifyRegistryClient::new(&env, &contract_id);
+    let contract_id = env.register_contract(None, GrainlifyContract);
+    let client = GrainlifyContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     let contract_a = Address::generate(&env);
-    let name = Symbol::new(&env, "vault");
-    client.init(&admin);
-    client.set_addr(&name, &contract_a);
-    let retrieved_addr = client.get_addr(&name);
-    assert_eq!(retrieved_addr, contract_a);
+    let name = String::from_str(&env, "vault");
+    client.init_admin(&admin);
+    client.register_deployed_contract(&contract_a, &name, &ContractKind::Other, &1u32);
+    let retrieved = client.get_deployed_contract(&contract_a).unwrap();
+    assert_eq!(retrieved.address, contract_a);
 }
 
 #[test]
-#[should_panic(expected = "Init")]
 fn test_cannot_init_twice() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, GrainlifyRegistry);
-    let client = GrainlifyRegistryClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, GrainlifyContract);
+    let client = GrainlifyContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.init(&admin);
-    client.init(&admin);
+    client.init_admin(&admin);
+    let result = client.try_init_admin(&admin);
+    assert!(result.is_err());
 }
 
 #[test]
-#[should_panic(expected = "NF")]
 fn test_get_nonexistent_address() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, GrainlifyRegistry);
-    let client = GrainlifyRegistryClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, GrainlifyContract);
+    let client = GrainlifyContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.init(&admin);
-    client.get_addr(&Symbol::new(&env, "nothing"));
+    client.init_admin(&admin);
+    assert!(client.get_deployed_contract(&Address::generate(&env)).is_none());
 }

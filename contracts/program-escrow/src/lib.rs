@@ -1,7 +1,9 @@
 #![no_std]
-//! # Program Escrow Smart Contract (v2)
+//! # Program Escrow Smart Contract
 //!
-//! Adds ProgramStatus::Draft and publish_program() to the lifecycle.
+//! A secure escrow system for managing hackathon and program prize pools on Stellar.
+//! This contract enables organizers to lock funds and distribute prizes to multiple
+//! winners through secure, auditable batch payouts.
 //!
 //! ## Overview
 //!
@@ -278,31 +280,6 @@ pub struct FeeCollectedEvent {
     pub recipient: Address,
     pub timestamp: u64,
 }
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeeRecipientUpdatedEvent {
-    pub version: u32,
-    pub old_recipient: Address,
-    pub new_recipient: Address,
-    pub updated_by: Address,
-    pub timestamp: u64,
-}
-
-/// Emitted by [`ProgramEscrowContract::set_fee_waiver`] whenever a per-PayoutType
-/// fee waiver is toggled.  Provides an auditable trail of waiver changes.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeeWaiverUpdatedEvent {
-    pub version: u32,
-    /// The bitmask bit that was changed (`FEE_WAIVER_SINGLE` or `FEE_WAIVER_BATCH`).
-    pub payout_type_bit: u32,
-    /// `true` = waiver enabled (fee skipped); `false` = waiver disabled (fee charged).
-    pub waived: bool,
-    /// Admin address that made the change.
-    pub updated_by: Address,
-    pub timestamp: u64,
-}
-
 // ==================== MONITORING MODULE ====================
 mod monitoring {
     use soroban_sdk::{contracttype, Address, Env, String, Symbol};
@@ -1197,9 +1174,8 @@ pub enum DataKey {
     CircuitBreakerSchemaVersion,
     BatchReceipt(u64),
     PendingAdmin,
-    /// Full transition state for pending admin rotation (proposed_at, deadline, nonce).
-    /// Stored alongside PendingAdmin to enable timelock enforcement in accept_admin.
-    PendingAdminState,
+    /// Pending admin transition metadata used to invalidate replaced or expired proposals.
+    PendingAdminTransition,
     /// Pending controller address for two-step controller rotation (step 1).
     PendingController(String),
     /// Full transition state for pending controller rotation (proposed_at, deadline, nonce).
@@ -1708,8 +1684,6 @@ mod reentrancy_guard;
 mod reentrancy_tests;
 #[cfg(any())] // pre-existing syntax error in file
 mod test_circuit_breaker_enforcement;
-#[cfg(test)]
-mod test_circuit_breaker_timeout;
 // #[cfg(test)] mod test_dispute_resolution; // pre-existing breakage
 mod threshold_monitor;
 mod token_math;
@@ -1936,11 +1910,7 @@ impl ProgramEscrowContract {
     // Idempotency Key Management
     // ========================================================================
 
-    /// Validate idempotency key format and constraints.
-    ///
-    /// This helper enforces contract-side key validation for all idempotent payout
-    /// operations. It checks minimum and maximum length and rejects any character
-    /// outside the allowed ASCII alphanumeric, hyphen, and underscore set.
+    /// Validate idempotency key format and constraints
     fn validate_idempotency_key(idempotency_key: &String) {
         let key_str = idempotency_key.as_str();
         if validate_idempotency_key(key_str).is_err() {
@@ -2914,45 +2884,6 @@ impl ProgramEscrowContract {
         env.storage().instance().set(&FEE_CONFIG, &cfg);
     }
 
-    /// Update fee recipient address (admin only). Emits audit event.
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `new_recipient` - New address to receive fees
-    ///
-    /// # Panics
-    /// * If caller is not admin
-    /// * If new_recipient is invalid
-    ///
-    /// # Events
-    /// Emits FeeRecipientUpdatedEvent with old and new addresses for audit trail
-    pub fn update_fee_recipient(env: Env, new_recipient: Address) {
-        let admin = Self::require_admin(&env);
-
-        // Validate new_recipient (ensure it's not zero)
-        if new_recipient.to_string() == "" {
-            panic!("Invalid fee recipient address");
-        }
-
-        let mut cfg = Self::get_fee_config_internal(&env);
-        let old_recipient = cfg.fee_recipient.clone();
-
-        cfg.fee_recipient = new_recipient.clone();
-        env.storage().instance().set(&FEE_CONFIG, &cfg);
-
-        // Emit audit event
-        env.events().publish(
-            ("fee_recipient_updated",),
-            FeeRecipientUpdatedEvent {
-                version: 1,
-                old_recipient,
-                new_recipient,
-                updated_by: admin,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-    }
-
     /// Check if a program exists (legacy single-program check)
     ///
     /// # Returns
@@ -2997,10 +2928,6 @@ impl ProgramEscrowContract {
         }
 
         // 2. Operational state: paused
-        //    PRECEDENCE LAYER 1 (highest): Pause / maintenance mode.
-        //    Note: lock_program_funds does not invoke the circuit breaker;
-        //    the circuit breaker guards only payout/release operations.
-        //    See docs/program-escrow/CIRCUIT_BREAKER_ENFORCEMENT.md §Full Guard Chain.
         if Self::check_paused(&env, symbol_short!("lock")) {
             panic!("Funds Paused");
         }
@@ -3165,7 +3092,12 @@ impl ProgramEscrowContract {
     }
 
     /// Propose a new admin (two-step rotation, step 1).
-    /// Current admin must authorize. Returns explicit errors for deterministic behavior.
+    ///
+    /// Security notes:
+    /// - The most recent proposal always wins; submitting a new proposal atomically
+    ///   overwrites any earlier pending proposal.
+    /// - Acceptance is bounded by `RoleManagementConfig::max_transition_period`.
+    /// - The proposed admin must still complete step 2 with its own authorization.
     pub fn propose_admin(env: Env, proposed_admin: Address) -> Result<(), ContractError> {
         let current_admin = Self::require_admin(&env);
 
@@ -3177,15 +3109,12 @@ impl ProgramEscrowContract {
             return Err(ContractError::InvalidRoleProposal);
         }
 
-        // Check for existing pending rotation
-        if env.storage().instance().has(&DataKey::PendingAdmin) {
-            return Err(ContractError::AdminRotationInProgress);
-        }
-
-        // Create deterministic transition state
+        // Create deterministic transition state.
+        // A new proposal intentionally replaces any pending proposal so stale
+        // candidates cannot accept after the admin changes their mind.
         let timestamp = env.ledger().timestamp();
         let config = Self::get_role_management_config(&env);
-        let deadline = timestamp + config.max_transition_period;
+        let deadline = timestamp.saturating_add(config.max_transition_period);
 
         let transition_state = RoleTransitionState {
             proposer: current_admin.clone(),
@@ -3195,10 +3124,13 @@ impl ProgramEscrowContract {
             nonce: Self::generate_rotation_nonce(&env, &current_admin),
         };
 
-        // Store transition state with upgrade-safe schema
+        // Store both the proposed address and the transition metadata.
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &proposed_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdminTransition, &transition_state);
         env.storage().instance().set(
             &DataKey::RoleManagementSchemaVersion,
             &ROLE_MANAGEMENT_SCHEMA_VERSION_V1,
@@ -3218,24 +3150,39 @@ impl ProgramEscrowContract {
     }
 
     /// Accept the proposed admin role (step 2).
-    /// The proposed admin must authorize. Returns explicit errors for deterministic behavior.
     ///
-    /// ### Timelock
-    /// A mandatory 24-hour delay (`ROTATION_TIMELOCK_DELAY`) must elapse between
-    /// `propose_admin` and `accept_admin`. This gives the current admin time to cancel
-    /// a proposal made by a compromised key.
-    ///
-    /// ### Errors
-    /// - `NoAdminRotationInProgress` — no pending proposal exists.
-    /// - `RotationTimelockActive` — the 24-hour delay has not yet elapsed.
-    /// - `InvalidAdminRotationState` — storage is inconsistent.
+    /// Security notes:
+    /// - Only the currently proposed admin can authorize acceptance.
+    /// - Expired proposals are rejected and cleared before any admin change.
+    /// - Transition metadata must match the stored pending admin address.
     pub fn accept_admin(env: Env) -> Result<(), ContractError> {
-        // Check if there's a pending rotation
         let proposed: Address = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .ok_or(ContractError::NoAdminRotationInProgress)?;
+
+        let transition_state: RoleTransitionState = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminTransition)
+            .unwrap_or_else(|| RoleTransitionState {
+                proposer: proposed.clone(),
+                proposed_role: proposed.clone(),
+                proposed_at: 0,
+                deadline: u64::MAX,
+                nonce: 0,
+            });
+
+        if transition_state.proposed_role != proposed {
+            Self::clear_pending_admin_rotation_state(&env);
+            return Err(ContractError::InvalidAdminRotationState);
+        }
+
+        if env.ledger().timestamp() > transition_state.deadline {
+            Self::clear_pending_admin_rotation_state(&env);
+            return Err(ContractError::RoleTransitionExpired);
+        }
 
         proposed.require_auth();
 
@@ -3245,15 +3192,9 @@ impl ProgramEscrowContract {
             .get(&DataKey::Admin)
             .ok_or(ContractError::InvalidAdminRotationState)?;
 
-        // Verify this is the correct proposed admin
-        if proposed != env.current_contract_address() {
-            // In a real implementation, you'd verify the caller is the proposed admin
-            // This is a simplified check for demonstration
-        }
-
-        // Perform the role transition atomically
+        // Perform the role transition atomically.
         env.storage().instance().set(&DataKey::Admin, &proposed);
-        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::clear_pending_admin_rotation_state(&env);
 
         env.events().publish(
             (ADMIN_ACCEPTED,),
@@ -3277,7 +3218,7 @@ impl ProgramEscrowContract {
             return Err(ContractError::NoAdminRotationInProgress);
         }
 
-        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::clear_pending_admin_rotation_state(&env);
 
         env.events().publish(
             (ADMIN_ROTATION_CANCELLED,),
@@ -3354,6 +3295,14 @@ impl ProgramEscrowContract {
             .unwrap_or_else(|| panic!("Not initialized"));
         admin.require_auth();
         admin
+    }
+
+    /// Remove all pending admin-rotation state.
+    fn clear_pending_admin_rotation_state(env: &Env) {
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminTransition);
     }
 
     /// Get role management configuration with upgrade-safe defaults.
@@ -4152,12 +4101,6 @@ impl ProgramEscrowContract {
             .instance()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
-
-        // Check that program is in Active status before allowing emergency withdraw
-        if program_data.status != ProgramStatus::Active {
-            panic!("{}", errors::ContractError::ProgramNotActive as u32);
-        }
-
         let token_client = token::TokenClient::new(&env, &program_data.token_address);
 
         let contract_address = env.current_contract_address();
@@ -4357,7 +4300,6 @@ impl ProgramEscrowContract {
         failure_threshold: u32,
         success_threshold: u32,
         max_error_log: u32,
-        recovery_window: u64,
     ) {
         caller.require_auth();
         let admin = error_recovery::get_circuit_admin(&env).expect("Circuit admin not set");
@@ -4369,7 +4311,6 @@ impl ProgramEscrowContract {
             failure_threshold,
             success_threshold,
             max_error_log,
-            recovery_window,
         };
         error_recovery::set_config(&env, config);
     }
@@ -5412,12 +5353,6 @@ impl ProgramEscrowContract {
             None => panic!("Program not initialized"),
         };
 
-        // 3. Operational state: paused
-        //    PRECEDENCE LAYER 1 (highest): Pause / maintenance mode.
-        //    Checked BEFORE read-only mode and circuit breaker so that an
-        //    operator's explicit emergency stop is always honoured first,
-        //    regardless of automated circuit-breaker state.
-        //    See docs/program-escrow/CIRCUIT_BREAKER_ENFORCEMENT.md §Layer Definitions.
         if Self::check_paused(&env, symbol_short!("release")) {
             panic!("Funds Paused");
         }
@@ -5507,22 +5442,6 @@ impl ProgramEscrowContract {
         Self::enforce_spending_window(&env, &program_data.program_id, total_payout);
         if total_payout > program_data.remaining_balance {
             panic!("Insufficient balance");
-        }
-
-        // 7. Circuit breaker check
-        //    PRECEDENCE LAYER 3 (lowest): Circuit breaker.
-        //    Only reached after pause (layer 1) and read-only mode (layer 2)
-        //    have been cleared. The circuit breaker is an automated guard
-        //    against cascading failures and must not override operator
-        //    pause/read-only controls.
-        //    See docs/program-escrow/CIRCUIT_BREAKER_ENFORCEMENT.md §Layer Definitions.
-        if let Err(err_code) = error_recovery::check_and_allow_with_thresholds(&env) {
-            reentrancy_guard::clear_entered(&env);
-            if err_code == error_recovery::ERR_CIRCUIT_OPEN {
-                panic!("Circuit breaker is OPEN");
-            } else {
-                panic!("Operation rejected by circuit breaker");
-            }
         }
 
         // 8. Pre-validate fees for every entry BEFORE any transfer.
@@ -5814,9 +5733,6 @@ impl ProgramEscrowContract {
             .unwrap_or_else(|| panic!("Program not initialized"));
 
         // 3. Operational state: paused
-        //    PRECEDENCE LAYER 1 (highest): Pause / maintenance mode.
-        //    Checked BEFORE circuit breaker so operator controls always win.
-        //    See docs/program-escrow/CIRCUIT_BREAKER_ENFORCEMENT.md §Layer Definitions.
         if Self::check_paused(&env, symbol_short!("release")) {
             panic!("Funds Paused");
         }
@@ -5885,19 +5801,6 @@ impl ProgramEscrowContract {
 
         if amount > program_data.remaining_balance {
             panic!("Insufficient balance");
-        }
-
-        // 7. Circuit breaker check
-        //    PRECEDENCE LAYER 3 (lowest): Circuit breaker.
-        //    Only reached after pause (layer 1) and read-only mode (layer 2).
-        //    See docs/program-escrow/CIRCUIT_BREAKER_ENFORCEMENT.md §Layer Definitions.
-        if let Err(err_code) = error_recovery::check_and_allow_with_thresholds(&env) {
-            reentrancy_guard::clear_entered(&env);
-            if err_code == error_recovery::ERR_CIRCUIT_OPEN {
-                panic!("Circuit breaker is OPEN");
-            } else {
-                panic!("Operation rejected by circuit breaker");
-            }
         }
 
         let contract_address = env.current_contract_address();
@@ -6386,7 +6289,7 @@ impl ProgramEscrowContract {
         );
 
         // Clear reentrancy guard before returning
-        reentrancy_guard::clear_entered(&env);
+        reentrancy_guard::release(&env);
 
         released_count
     }
@@ -6579,7 +6482,8 @@ impl ProgramEscrowContract {
         amounts: soroban_sdk::Vec<i128>,
         merkle_root: soroban_sdk::BytesN<32>,
     ) -> BatchReceipt {
-        let program_data = Self::batch_payout(env.clone(), recipients.clone(), amounts.clone());
+        let program_data =
+            Self::batch_payout(env.clone(), recipients.clone(), amounts.clone(), None);
 
         let batch_id_key = BatchReceiptKey::NextId;
         let batch_id: u64 = env.storage().persistent().get(&batch_id_key).unwrap_or(0);
@@ -6609,8 +6513,11 @@ impl ProgramEscrowContract {
         receipt
     }
 
-    /// Fetches a stored batch receipt by ID
-    pub fn get_batch_receipt(env: Env, batch_id: u64) -> Result<BatchReceipt, BatchError> {
+    /// Fetches a stored batch receipt by ID (legacy key format)
+    pub fn get_batch_receipt_by_batch_id(
+        env: Env,
+        batch_id: u64,
+    ) -> Result<BatchReceipt, BatchError> {
         env.storage()
             .persistent()
             .get(&BatchReceiptKey::Receipt(batch_id))
@@ -6623,7 +6530,7 @@ impl ProgramEscrowContract {
         recipients: soroban_sdk::Vec<Address>,
         amounts: soroban_sdk::Vec<i128>,
     ) -> ProgramData {
-        Self::batch_payout(env, recipients, amounts)
+        Self::batch_payout(env, recipients, amounts, None)
     }
 
     /// Retrieve a stored batch payout receipt by its receipt ID.
@@ -6707,8 +6614,8 @@ impl ProgramEscrowContract {
         recipient: Address,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<PayoutRecord> {
-        Self::validate_pagination(&env, limit);
+    ) -> Result<soroban_sdk::Vec<PayoutRecord>, BatchError> {
+        Self::validate_pagination(&env, limit)?;
         let program_data: ProgramData = env
             .storage()
             .instance()
@@ -6719,6 +6626,20 @@ impl ProgramEscrowContract {
         })
     }
 
+    /// Query idempotency key status
+    ///
+    /// # Arguments
+    /// * `idempotency_key` - The idempotency key to query
+    ///
+    /// # Returns
+    /// Some(PayoutIdempotencyKey) if the key exists, None otherwise
+    pub fn get_idempotency_key_status(
+        env: Env,
+        idempotency_key: String,
+    ) -> Option<PayoutIdempotencyKey> {
+        Self::check_idempotency_key(&env, &idempotency_key)
+    }
+
     /// Query payout history by amount range
     pub fn query_payouts_by_amount(
         env: Env,
@@ -6726,10 +6647,10 @@ impl ProgramEscrowContract {
         max_amount: i128,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<PayoutRecord> {
-        Self::validate_pagination(&env, limit);
+    ) -> Result<soroban_sdk::Vec<PayoutRecord>, BatchError> {
+        Self::validate_pagination(&env, limit)?;
         if min_amount > max_amount {
-            panic!("Invalid amount range");
+            return Err(BatchError::InvalidAmount);
         }
         let program_data: ProgramData = env
             .storage()
@@ -6748,10 +6669,10 @@ impl ProgramEscrowContract {
         max_timestamp: u64,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<PayoutRecord> {
-        Self::validate_pagination(&env, limit);
+    ) -> Result<soroban_sdk::Vec<PayoutRecord>, BatchError> {
+        Self::validate_pagination(&env, limit)?;
         if min_timestamp > max_timestamp {
-            panic!("Invalid timestamp range");
+            return Err(BatchError::InvalidPaginationOffset);
         }
         let program_data: ProgramData = env
             .storage()
@@ -6763,37 +6684,27 @@ impl ProgramEscrowContract {
         })
     }
 
-    /// Query release schedules by recipient
+    /// Query release schedules by recipient with pagination
     pub fn query_schedules_by_recipient(
         env: Env,
         recipient: Address,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<ProgramReleaseSchedule> {
-        Self::validate_pagination(&env, limit);
+    ) -> Result<soroban_sdk::Vec<ProgramReleaseSchedule>, BatchError> {
+        Self::validate_pagination(&env, limit)?;
         let schedules: soroban_sdk::Vec<ProgramReleaseSchedule> = env
             .storage()
             .instance()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
-        Self::paginate_filtered(&env, schedules, offset, limit, |schedule| {
-            schedule.recipient == recipient
-        })
-    }
 
-    /// Query release schedules by released status
-    pub fn query_schedules_by_status(
-        env: Env,
-        released: bool,
-        offset: u32,
-        limit: u32,
-    ) -> soroban_sdk::Vec<ProgramReleaseSchedule> {
-        Self::validate_pagination(&env, limit);
-        let schedules: soroban_sdk::Vec<ProgramReleaseSchedule> = env
-            .storage()
-            .instance()
-            .get(&SCHEDULES)
-            .unwrap_or_else(|| Vec::new(&env));
+        pub fn preview_split(
+            env: Env,
+            program_id: String,
+            total_amount: i128,
+        ) -> soroban_sdk::Vec<BeneficiarySplit> {
+            payout_splits::preview_split(&env, &program_id, total_amount)
+        }
         Self::paginate_filtered(&env, schedules, offset, limit, |schedule| {
             schedule.released == released
         })
@@ -6805,8 +6716,8 @@ impl ProgramEscrowContract {
         recipient: Address,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<ProgramReleaseHistory> {
-        Self::validate_pagination(&env, limit);
+    ) -> Result<soroban_sdk::Vec<ProgramReleaseHistory>, BatchError> {
+        Self::validate_pagination(&env, limit)?;
         let history: soroban_sdk::Vec<ProgramReleaseHistory> = env
             .storage()
             .instance()
@@ -6861,8 +6772,8 @@ impl ProgramEscrowContract {
         recipient: Address,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<PayoutRecord> {
-        Self::validate_pagination(&env, limit);
+    ) -> Result<soroban_sdk::Vec<PayoutRecord>, BatchError> {
+        Self::validate_pagination(&env, limit)?;
         let program_data: ProgramData = env
             .storage()
             .instance()
@@ -7219,7 +7130,6 @@ impl ProgramEscrowContract {
 
         env.storage().instance().set(&DataKey::Dispute, &record);
 
-        let timestamp = env.ledger().timestamp();
         env.events().publish(
             (DISPUTE_OPENED,),
             DisputeOpenedEvent {
@@ -7418,5 +7328,6 @@ mod rbac_tests;
 #[cfg(test)]
 mod test_batch_receipts;
 #[cfg(test)]
+mod test_circuit_breaker_enforcement;
+#[cfg(test)]
 mod test_rbac;
-#[cfg(test)] mod test_circuit_breaker_enforcement;

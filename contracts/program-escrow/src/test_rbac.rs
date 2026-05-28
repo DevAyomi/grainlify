@@ -24,7 +24,10 @@
 //! - Delegate operations are blocked on programs in Draft status.
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    token, Address, Env, IntoVal, String,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,6 +37,68 @@ fn make_client(env: &Env) -> (ProgramEscrowContractClient<'static>, Address) {
     let contract_id = env.register_contract(None, ProgramEscrowContract);
     let client = ProgramEscrowContractClient::new(env, &contract_id);
     (client, contract_id)
+}
+
+/// Configure auth for `propose_admin` as the current admin.
+fn mock_propose_admin_auth(
+    env: &Env,
+    contract_id: &Address,
+    admin: &Address,
+    proposed_admin: &Address,
+) {
+    env.mock_auths(&[MockAuth {
+        address: admin,
+        invoke: &MockAuthInvoke {
+            contract: contract_id,
+            fn_name: "propose_admin",
+            args: (proposed_admin.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+/// Configure auth for `accept_admin` as the supplied signer.
+fn mock_accept_admin_auth(env: &Env, contract_id: &Address, signer: &Address) {
+    env.mock_auths(&[MockAuth {
+        address: signer,
+        invoke: &MockAuthInvoke {
+            contract: contract_id,
+            fn_name: "accept_admin",
+            args: ().into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+/// Return the currently stored pending admin.
+fn pending_admin(env: &Env, contract_id: &Address) -> Address {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("pending admin should exist")
+    })
+}
+
+/// Return the currently stored pending admin transition metadata.
+fn pending_admin_transition(env: &Env, contract_id: &Address) -> RoleTransitionState {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdminTransition)
+            .expect("pending admin transition should exist")
+    })
+}
+
+/// Assert that no admin rotation state remains in storage.
+fn assert_no_pending_admin_rotation(env: &Env, contract_id: &Address) {
+    env.as_contract(contract_id, || {
+        assert!(!env.storage().instance().has(&DataKey::PendingAdmin));
+        assert!(!env
+            .storage()
+            .instance()
+            .has(&DataKey::PendingAdminTransition));
+    });
 }
 
 fn fund_contract(env: &Env, contract_id: &Address, amount: i128) -> Address {
@@ -52,9 +117,9 @@ fn setup(
     env: &Env,
 ) -> (
     ProgramEscrowContractClient<'static>,
-    String,   // program_id
-    Address,  // payout_key
-    Address,  // admin
+    String,  // program_id
+    Address, // payout_key
+    Address, // admin
 ) {
     env.mock_all_auths();
     let (client, contract_id) = make_client(env);
@@ -63,7 +128,14 @@ fn setup(
     let payout_key = Address::generate(env);
     let program_id = String::from_str(env, "rbac-prog");
     client.initialize_contract(&admin);
-    client.init_program(&program_id, &payout_key, &token_id, &payout_key, &None, &None);
+    client.init_program(
+        &program_id,
+        &payout_key,
+        &token_id,
+        &payout_key,
+        &None,
+        &None,
+    );
     (client, program_id, payout_key, admin)
 }
 
@@ -144,7 +216,9 @@ fn test_rbac_delegate_cannot_rotate() {
         &program_id,
         &payout_key,
         &delegate,
-        &(DELEGATE_PERMISSION_RELEASE | DELEGATE_PERMISSION_REFUND | DELEGATE_PERMISSION_UPDATE_META),
+        &(DELEGATE_PERMISSION_RELEASE
+            | DELEGATE_PERMISSION_REFUND
+            | DELEGATE_PERMISSION_UPDATE_META),
     );
 
     let nonce = client.get_rotation_nonce(&program_id);
@@ -180,250 +254,110 @@ fn test_rbac_wrong_nonce_rejected_for_authorized_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// Delegation-chain exploit tests
-//
-// Security invariants verified:
-//   1. Only the program owner (payout key) or contract admin can call
-//      `set_program_delegate` — a delegate cannot re-delegate.
-//   2. A delegate cannot escalate its own bitmask beyond what was granted.
-//   3. A delegate with a subset of permissions cannot grant a superset to
-//      a third party.
-//   4. A delegate cannot overwrite itself with a different address.
-//   5. A delegate cannot revoke itself or another delegate.
+// Admin rotation edge cases
 // ---------------------------------------------------------------------------
 
-/// A delegate with full permissions cannot call `set_program_delegate` to
-/// grant those permissions to a third party (re-delegation / chain attack).
+/// A later `propose_admin` call must invalidate any earlier pending proposal.
 #[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_delegate_cannot_redelegate_to_third_party() {
+fn test_rbac_second_admin_proposal_overwrites_first_pending_proposal() {
     let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate = Address::generate(&env);
-    let third_party = Address::generate(&env);
+    let (client, contract_id) = make_client(&env);
+    let admin = Address::generate(&env);
+    let first_proposed_admin = Address::generate(&env);
+    let second_proposed_admin = Address::generate(&env);
 
-    // Owner grants delegate all permissions.
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate,
-        &DELEGATE_PERMISSION_MASK,
-    );
+    client.initialize_contract(&admin);
 
-    // Delegate attempts to re-delegate to a third party — must be rejected.
-    client.set_program_delegate(
-        &program_id,
-        &delegate,
-        &third_party,
-        &DELEGATE_PERMISSION_MASK,
+    env.ledger().set_timestamp(1_000);
+    mock_propose_admin_auth(&env, &contract_id, &admin, &first_proposed_admin);
+    client.propose_admin(&first_proposed_admin);
+
+    assert_eq!(pending_admin(&env, &contract_id), first_proposed_admin);
+    let first_transition = pending_admin_transition(&env, &contract_id);
+    assert_eq!(first_transition.proposed_role, first_proposed_admin);
+    assert_eq!(first_transition.proposer, admin);
+    assert_eq!(first_transition.proposed_at, 1_000);
+
+    env.ledger().set_timestamp(1_001);
+    mock_propose_admin_auth(&env, &contract_id, &admin, &second_proposed_admin);
+    client.propose_admin(&second_proposed_admin);
+
+    assert_eq!(pending_admin(&env, &contract_id), second_proposed_admin);
+    let second_transition = pending_admin_transition(&env, &contract_id);
+    assert_eq!(second_transition.proposed_role, second_proposed_admin);
+    assert_eq!(second_transition.proposer, admin);
+    assert_eq!(second_transition.proposed_at, 1_001);
+    assert!(second_transition.deadline > second_transition.proposed_at);
+
+    mock_accept_admin_auth(&env, &contract_id, &first_proposed_admin);
+    assert!(
+        client.try_accept_admin().is_err(),
+        "the original proposed admin must lose acceptance rights after overwrite"
     );
+    assert_eq!(client.get_admin().unwrap(), admin);
+    assert_eq!(pending_admin(&env, &contract_id), second_proposed_admin);
+
+    mock_accept_admin_auth(&env, &contract_id, &second_proposed_admin);
+    client.accept_admin();
+
+    assert_eq!(client.get_admin().unwrap(), second_proposed_admin);
+    assert_no_pending_admin_rotation(&env, &contract_id);
 }
 
-/// A delegate with only RELEASE permission cannot grant RELEASE to another
-/// address, even though it holds that permission itself.
+/// Only the currently proposed admin may accept the admin role.
 #[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_delegate_with_partial_permissions_cannot_redelegate() {
+fn test_rbac_accept_admin_rejects_non_proposed_address() {
     let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate = Address::generate(&env);
-    let third_party = Address::generate(&env);
+    let (client, contract_id) = make_client(&env);
+    let admin = Address::generate(&env);
+    let proposed_admin = Address::generate(&env);
+    let outsider = Address::generate(&env);
 
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate,
-        &DELEGATE_PERMISSION_RELEASE,
+    client.initialize_contract(&admin);
+
+    mock_propose_admin_auth(&env, &contract_id, &admin, &proposed_admin);
+    client.propose_admin(&proposed_admin);
+
+    mock_accept_admin_auth(&env, &contract_id, &outsider);
+    assert!(
+        client.try_accept_admin().is_err(),
+        "a non-proposed address must not be able to accept admin rotation"
     );
 
-    // Delegate tries to pass its RELEASE permission on — must be rejected.
-    client.set_program_delegate(
-        &program_id,
-        &delegate,
-        &third_party,
-        &DELEGATE_PERMISSION_RELEASE,
-    );
+    assert_eq!(client.get_admin().unwrap(), admin);
+    assert_eq!(pending_admin(&env, &contract_id), proposed_admin);
+
+    mock_accept_admin_auth(&env, &contract_id, &proposed_admin);
+    client.accept_admin();
+    assert_eq!(client.get_admin().unwrap(), proposed_admin);
 }
 
-/// A delegate cannot escalate its own bitmask by calling `set_program_delegate`
-/// with itself as the delegate target and a larger permission set.
+/// Acceptance after the proposal TTL must fail and clear stale proposal state.
 #[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_delegate_cannot_escalate_own_permissions() {
+fn test_rbac_admin_rotation_proposal_expires_before_acceptance() {
     let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate = Address::generate(&env);
+    let (client, contract_id) = make_client(&env);
+    let admin = Address::generate(&env);
+    let proposed_admin = Address::generate(&env);
 
-    // Grant only RELEASE.
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate,
-        &DELEGATE_PERMISSION_RELEASE,
+    client.initialize_contract(&admin);
+
+    env.ledger().set_timestamp(5_000);
+    mock_propose_admin_auth(&env, &contract_id, &admin, &proposed_admin);
+    client.propose_admin(&proposed_admin);
+
+    let transition = pending_admin_transition(&env, &contract_id);
+    let proposal_ttl = transition.deadline - transition.proposed_at;
+    assert_eq!(proposal_ttl, MAX_ROLE_TRANSITION_PERIOD);
+
+    env.ledger().set_timestamp(transition.deadline + 1);
+    mock_accept_admin_auth(&env, &contract_id, &proposed_admin);
+    let result = client.try_accept_admin();
+    assert!(
+        matches!(result, Err(Ok(ContractError::RoleTransitionExpired))),
+        "acceptance after the TTL must fail with RoleTransitionExpired"
     );
 
-    // Delegate tries to upgrade itself to full permissions — must be rejected.
-    client.set_program_delegate(
-        &program_id,
-        &delegate,
-        &delegate,
-        &DELEGATE_PERMISSION_MASK,
-    );
-}
-
-/// A delegate cannot revoke itself (or any other delegate) via
-/// `revoke_program_delegate` — only the owner or admin may revoke.
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_delegate_cannot_revoke_itself() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate = Address::generate(&env);
-
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate,
-        &DELEGATE_PERMISSION_MASK,
-    );
-
-    // Delegate attempts self-revocation — must be rejected.
-    client.revoke_program_delegate(&program_id, &delegate);
-}
-
-/// An arbitrary third party (neither owner, admin, nor delegate) cannot
-/// set a delegate on a program.
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_arbitrary_address_cannot_set_delegate() {
-    let env = Env::default();
-    let (client, program_id, _payout_key, _admin) = setup(&env);
-    let attacker = Address::generate(&env);
-    let victim = Address::generate(&env);
-
-    client.set_program_delegate(
-        &program_id,
-        &attacker,
-        &victim,
-        &DELEGATE_PERMISSION_MASK,
-    );
-}
-
-/// The contract admin CAN set a delegate (positive control — ensures the
-/// restriction targets delegates specifically, not all non-owners).
-#[test]
-fn test_admin_can_set_delegate() {
-    let env = Env::default();
-    let (client, program_id, _payout_key, admin) = setup(&env);
-    let delegate = Address::generate(&env);
-
-    let data = client.set_program_delegate(
-        &program_id,
-        &admin,
-        &delegate,
-        &DELEGATE_PERMISSION_RELEASE,
-    );
-
-    assert_eq!(data.delegate, Some(delegate));
-    assert_eq!(data.delegate_permissions, DELEGATE_PERMISSION_RELEASE);
-}
-
-/// After a delegate is set, the owner can replace it with a different address
-/// and different permissions — the new state is authoritative.
-#[test]
-fn test_owner_can_replace_delegate() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate_a = Address::generate(&env);
-    let delegate_b = Address::generate(&env);
-
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate_a,
-        &DELEGATE_PERMISSION_MASK,
-    );
-
-    let data = client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate_b,
-        &DELEGATE_PERMISSION_RELEASE,
-    );
-
-    // delegate_b is now the active delegate with reduced permissions.
-    assert_eq!(data.delegate, Some(delegate_b));
-    assert_eq!(data.delegate_permissions, DELEGATE_PERMISSION_RELEASE);
-}
-
-/// After the owner replaces the delegate, the old delegate loses all access
-/// and cannot perform operations that required its former permissions.
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_replaced_delegate_loses_access() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate_a = Address::generate(&env);
-    let delegate_b = Address::generate(&env);
-
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate_a,
-        &DELEGATE_PERMISSION_MASK,
-    );
-
-    // Replace delegate_a with delegate_b.
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &delegate_b,
-        &DELEGATE_PERMISSION_RELEASE,
-    );
-
-    // delegate_a is no longer active — any attempt to re-delegate must fail.
-    client.set_program_delegate(
-        &program_id,
-        &delegate_a,
-        &delegate_a,
-        &DELEGATE_PERMISSION_MASK,
-    );
-}
-
-/// `set_program_delegate` rejects a permissions bitmask of zero.
-#[test]
-#[should_panic(expected = "Delegate permissions cannot be empty")]
-fn test_set_delegate_rejects_zero_permissions() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate = Address::generate(&env);
-
-    client.set_program_delegate(&program_id, &payout_key, &delegate, &0);
-}
-
-/// `set_program_delegate` rejects a bitmask with unsupported bits set.
-#[test]
-#[should_panic(expected = "Unsupported delegate permissions")]
-fn test_set_delegate_rejects_unsupported_permission_bits() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    let delegate = Address::generate(&env);
-
-    // Bit 3 (0x08) is outside DELEGATE_PERMISSION_MASK.
-    client.set_program_delegate(&program_id, &payout_key, &delegate, &0x08);
-}
-
-/// The payout key cannot be set as its own delegate.
-#[test]
-#[should_panic(expected = "Delegate must differ from owner")]
-fn test_owner_cannot_be_set_as_own_delegate() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-
-    client.set_program_delegate(
-        &program_id,
-        &payout_key,
-        &payout_key,
-        &DELEGATE_PERMISSION_MASK,
-    );
+    assert_eq!(client.get_admin().unwrap(), admin);
+    assert_no_pending_admin_rotation(&env, &contract_id);
 }

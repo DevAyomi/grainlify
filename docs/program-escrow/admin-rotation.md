@@ -1,160 +1,81 @@
-# Admin & Controller Rotation — `program-escrow`
+# Program Escrow Admin Rotation
 
 ## Overview
 
-The `ProgramEscrowContract` uses a **two-step rotation** pattern for both the contract admin and per-program controller (authorized payout key). A mandatory **24-hour time-lock** is enforced between proposing and accepting a rotation, giving the current admin time to cancel a proposal made by a compromised key.
+`program-escrow` uses a two-step admin rotation flow:
 
----
+1. The current admin calls `propose_admin`.
+2. The proposed admin calls `accept_admin`.
 
-## Security Motivation
+This reduces the risk of rotating control to an address that cannot or does not intend to assume the role.
 
-Without a time-lock, an attacker who briefly compromises the proposer key can immediately complete the rotation before the team notices. The 24-hour delay provides a detection and cancellation window.
+## Current behavior
 
----
+### Proposal replacement
 
-## Admin Rotation
+A new `propose_admin` call **overwrites** any existing pending admin proposal.
 
-### Step 1 — `propose_admin`
+This is intentional and security-sensitive:
 
-```rust
-pub fn propose_admin(env: Env, proposed_admin: Address) -> Result<(), ContractError>
-```
+- the latest admin intent wins
+- an older proposed admin cannot later accept after being replaced
+- reviewers only need to reason about a single active proposal at a time
 
-- Requires the current admin to authorize.
-- Stores the proposed address and a `RoleTransitionState` (including `proposed_at` timestamp) in contract storage.
-- Emits `AdminProposedEvent`.
+### Acceptance authorization
 
-### Step 2 — `accept_admin`
+Only the **currently proposed admin** can complete `accept_admin`.
 
-```rust
-pub fn accept_admin(env: Env) -> Result<(), ContractError>
-```
+A non-proposed address is rejected because the contract requires authorization from the stored pending admin address.
 
-- Requires the proposed admin to authorize.
-- **Enforces a 24-hour delay**: reverts with `RotationTimelockActive` if `now < proposed_at + ROTATION_TIMELOCK_DELAY`.
-- On success, atomically updates the admin and clears the pending state.
-- Emits `AdminAcceptedEvent`.
+### Proposal expiry
 
-### Cancel — `cancel_admin_rotation`
+Each proposal stores transition metadata, including:
 
-```rust
-pub fn cancel_admin_rotation(env: Env) -> Result<(), ContractError>
-```
+- proposer
+- proposed role address
+- proposal timestamp
+- acceptance deadline
+- nonce
 
-- Requires the **current admin** to authorize.
-- Can be called at any time during the timelock window (or after).
-- Clears both `PendingAdmin` and `PendingAdminState` from storage.
-- Emits `AdminRotationCancelledEvent`.
+Acceptance is rejected once the current ledger timestamp exceeds the stored deadline.
+Expired proposals are cleared from storage before returning an error so stale state cannot be reused.
 
----
+## Security notes
 
-## Controller Rotation
+### Last-write-wins is safer than multiple pending proposals
 
-### Step 1 — `propose_controller`
+Allowing multiple valid pending proposals would make admin rotation ambiguous and could let an outdated candidate unexpectedly seize control. The contract now treats admin rotation as a **single-slot state machine**:
 
-```rust
-pub fn propose_controller(
-    env: Env,
-    program_id: String,
-    caller: Address,
-    proposed_controller: Address,
-) -> Result<ProgramData, ContractError>
-```
+- one pending admin address
+- one pending transition record
+- any new proposal atomically replaces both
 
-- Requires the current controller or admin to authorize.
-- Stores the proposed address and a `RoleTransitionState` in contract storage.
-- Emits `ControllerProposedEvent`.
+### Expired proposals are invalidated eagerly
 
-### Step 2 — `accept_controller`
+On expired acceptance attempts, the contract clears:
 
-```rust
-pub fn accept_controller(env: Env, program_id: String) -> Result<ProgramData, ContractError>
-```
+- `PendingAdmin`
+- `PendingAdminTransition`
 
-- Requires the proposed controller to authorize.
-- **Enforces a 24-hour delay**: reverts with `RotationTimelockActive` if `now < proposed_at + ROTATION_TIMELOCK_DELAY`.
-- On success, atomically updates the program's `authorized_payout_key` and clears the pending state.
-- Emits `ControllerAcceptedEvent`.
+That ensures stale proposals cannot linger after their TTL has elapsed.
 
-### Cancel — `cancel_controller_rotation`
+### Backward-compatibility note
 
-```rust
-pub fn cancel_controller_rotation(
-    env: Env,
-    program_id: String,
-    caller: Address,
-) -> Result<ProgramData, ContractError>
-```
+`accept_admin` tolerates legacy state where only `PendingAdmin` is present by falling back to a no-expiry transition record. Newly created proposals always write the full transition metadata.
 
-- Requires the current controller or admin to authorize.
-- Can be called at any time during the timelock window (or after).
-- Clears both `PendingController` and `PendingControllerState` from storage.
-- Emits `ControllerRotationCancelledEvent`.
+## Tests added
 
----
+The RBAC coverage in `contracts/program-escrow/src/test_rbac.rs` now verifies:
 
-## Time-Lock Constant
+1. a second `propose_admin` overwrites the first pending proposal
+2. `accept_admin` from a non-proposed address is rejected
+3. acceptance after the proposal TTL fails with `RoleTransitionExpired`
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `ROTATION_TIMELOCK_DELAY` | `86_400` | Mandatory delay in seconds (24 hours) between proposal and acceptance |
+The broader regression suite in `contracts/program-escrow/src/test.rs` was also updated so legacy expectations match the new overwrite semantics.
 
----
+## Reviewer checklist
 
-## Error Codes
-
-| Error | Code | Description |
-|-------|------|-------------|
-| `AdminRotationInProgress` | 1200 | A rotation is already pending; cancel it first |
-| `NoAdminRotationInProgress` | 1201 | No pending proposal to accept or cancel |
-| `InvalidAdminRotationState` | 1202 | Storage inconsistency (should not occur in normal operation) |
-| `ControllerRotationInProgress` | 1203 | A rotation is already pending for this program |
-| `NoControllerRotationInProgress` | 1204 | No pending proposal for this program |
-| `InvalidControllerRotationState` | 1205 | Storage inconsistency |
-| `RotationTimelockActive` | 1209 | The 24-hour delay has not yet elapsed since the proposal |
-
----
-
-## Storage Keys
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `PendingAdmin` | `Address` | Proposed admin address |
-| `PendingAdminState` | `RoleTransitionState` | Full transition state including `proposed_at` |
-| `PendingController(program_id)` | `Address` | Proposed controller address |
-| `PendingControllerState(program_id)` | `RoleTransitionState` | Full transition state including `proposed_at` |
-
----
-
-## Sequence Diagram
-
-```
-Current Admin          Proposed Admin         Contract
-     |                      |                    |
-     |-- propose_admin() --->|                    |
-     |                      |  stores PendingAdmin + PendingAdminState(proposed_at=T)
-     |                      |                    |
-     |   [24h window — admin can cancel]          |
-     |                      |                    |
-     |                      |-- accept_admin() -->|
-     |                      |  if now < T + 86400 → RotationTimelockActive
-     |                      |  if now >= T + 86400 → success, admin updated
-```
-
----
-
-## Example
-
-```rust
-// Step 1: propose at timestamp T
-env.ledger().with_mut(|li| li.timestamp = T);
-contract.propose_admin(&new_admin);
-
-// Step 2: accept after 24h
-env.ledger().with_mut(|li| li.timestamp = T + 86_400);
-contract.accept_admin(); // succeeds
-
-// Or cancel within the window
-env.ledger().with_mut(|li| li.timestamp = T + 3_600); // 1h later
-contract.cancel_admin_rotation(); // cancels safely
-```
+- Confirm `propose_admin` writes both pending-address and transition metadata.
+- Confirm `accept_admin` rejects expired proposals before mutating `Admin`.
+- Confirm successful acceptance clears all pending admin rotation state.
+- Confirm replacement proposals invalidate the previously proposed address.

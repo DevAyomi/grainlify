@@ -184,6 +184,10 @@ const PROGRAM_INDEX: Symbol = symbol_short!("ProgIdx");
 const AUTH_KEY_INDEX: Symbol = symbol_short!("AuthIdx");
 const FEE_CONFIG: Symbol = symbol_short!("FeeCfg");
 const FEE_COLLECTED: Symbol = symbol_short!("FeeCol");
+/// Storage key for the set of consumed idempotency keys (batch payout).
+const PAYOUT_IDEM_KEYS: Symbol = symbol_short!("PayIdem");
+/// Event symbol emitted when a batch_payout replay is detected.
+const BATCH_PAYOUT_REPLAYED: Symbol = symbol_short!("BatPayRp");
 
 // Fee rate is stored in basis points (1 basis point = 0.01%)
 // Example: 100 basis points = 1%, 1000 basis points = 10%
@@ -447,6 +451,20 @@ pub struct BatchPayoutEvent {
     pub recipient_count: u32,
     pub total_amount: i128,
     pub remaining_balance: i128,
+    /// Optional idempotency key for auditing.
+    pub idempotency_key: Option<String>,
+}
+
+/// Emitted when a `batch_payout_idempotent` call is rejected because the
+/// supplied idempotency key was already consumed by a prior successful payout.
+/// Auditors can use this event to confirm that no double-payment occurred.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchPayoutReplayedEvent {
+    pub version: u32,
+    pub program_id: String,
+    /// The idempotency key that was replayed.
+    pub idempotency_key: String,
 }
 
 #[contracttype]
@@ -4633,6 +4651,18 @@ impl ProgramEscrowContract {
     /// Only the program's `authorized_payout_key` may call this.
     ///
     /// # Arguments
+    /// * `recipients` - Vector of winner addresses.
+    /// * `amounts` - Vector of prize amounts (must match recipients length).
+    ///
+    /// # Returns
+    /// The updated `ProgramData` reflecting the new balance and payout history.
+    ///
+    /// # Security
+    /// - Requires authorization from the `authorized_payout_key`.
+    /// - Protected by reentrancy guard.
+    /// - Respects circuit breaker and threshold limits.
+    pub fn batch_payout(env: Env, recipients: soroban_sdk::Vec<Address>, amounts: soroban_sdk::Vec<i128>) -> ProgramData {
+        Self::batch_payout_internal(env, None, None, recipients, amounts)
     /// * `program_id`   - Program to configure.
     /// * `window_size`  - Window length in seconds (must be > 0).
     /// * `max_amount`   - Max total releasable in one window (must be >= 0).
@@ -4667,6 +4697,101 @@ impl ProgramEscrowContract {
     /// Return the spending limit configuration for a program, if set.
     pub fn get_program_spending_limit(
         env: Env,
+        caller: Address,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> ProgramData {
+        Self::batch_payout_internal(env, Some(caller), None, recipients, amounts)
+    }
+
+    /// Execute a batch payout guarded by an idempotency key.
+    ///
+    /// If `idempotency_key` has already been consumed by a prior successful
+    /// call, the function emits a [`BatchPayoutReplayedEvent`] and returns the
+    /// current [`ProgramData`] **without** transferring any funds.  This makes
+    /// the operation safe to retry from the backend without risk of
+    /// double-payment.
+    ///
+    /// # Arguments
+    /// * `idempotency_key` – Caller-supplied unique string (e.g. UUID or
+    ///   content-hash of the payout batch).  Must be ≤ 64 bytes.
+    /// * `recipients` / `amounts` – Same semantics as [`batch_payout`].
+    ///
+    /// # Security
+    /// - Idempotency keys are stored in persistent storage and never expire.
+    /// - A key is only marked consumed **after** all transfers succeed.
+    /// - Replay detection runs before any state mutation.
+    pub fn batch_payout_idempotent(
+        env: Env,
+        idempotency_key: String,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> ProgramData {
+        Self::batch_payout_idempotent_internal(env, idempotency_key, None, recipients, amounts)
+    }
+
+    /// Delegate variant of [`batch_payout_idempotent`].
+    pub fn batch_payout_idempotent_by(
+        env: Env,
+        idempotency_key: String,
+        caller: Address,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> ProgramData {
+        Self::batch_payout_idempotent_internal(
+            env,
+            idempotency_key,
+            Some(caller),
+            recipients,
+            amounts,
+        )
+    }
+
+    fn batch_payout_idempotent_internal(
+        env: Env,
+        idempotency_key: String,
+        caller: Option<Address>,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> ProgramData {
+        // Load current program data for the replay-event payload.
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        // Load the set of consumed keys (Vec<String> stored persistently).
+        let mut used_keys: soroban_sdk::Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&PAYOUT_IDEM_KEYS)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        // Replay detection: scan for the key.
+        for k in used_keys.iter() {
+            if k == idempotency_key {
+                // Emit audit event so auditors can confirm no double-payment.
+                env.events().publish(
+                    (BATCH_PAYOUT_REPLAYED,),
+                    BatchPayoutReplayedEvent {
+                        version: EVENT_VERSION_V2,
+                        program_id: program_data.program_id.clone(),
+                        idempotency_key: idempotency_key.clone(),
+                    },
+                );
+                return program_data;
+            }
+        }
+
+        // Key is fresh — execute the real payout.
+        let result = Self::batch_payout_internal(env.clone(), caller, Some(idempotency_key.clone()), recipients, amounts);
+
+        // Mark key as consumed only after successful execution.
+        used_keys.push_back(idempotency_key);
+        env.storage().persistent().set(&PAYOUT_IDEM_KEYS, &used_keys);
+
+        result
         program_id: String,
     ) -> Option<ProgramSpendingConfig> {
         env.storage()
@@ -4677,6 +4802,18 @@ impl ProgramEscrowContract {
     /// Return the current window state for a program's spending limit, if any.
     pub fn get_program_spending_state(
         env: Env,
+        caller: Option<Address>,
+        idempotency_key: Option<String>,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> ProgramData {
+        // Validation precedence (deterministic ordering):
+        // 1. Reentrancy guard
+        // 2. Contract initialized
+        // 3. Paused (operational state)
+        // 4. Authorization
+        // 6. Business logic (sufficient balance)
+        // 7. Circuit breaker check
         program_id: String,
     ) -> Option<ProgramSpendingState> {
         env.storage()
@@ -5078,6 +5215,11 @@ impl ProgramEscrowContract {
             (TOKEN_ALLOWLIST_UPDATED,),
             TokenAllowlistUpdatedEvent {
                 version: EVENT_VERSION_V2,
+                program_id: updated_data.program_id.clone(),
+                recipient_count: recipients.len() as u32,
+                total_amount: total_payout,
+                remaining_balance: updated_data.remaining_balance,
+                idempotency_key,
                 token,
                 added: false,
                 updated_by: admin,

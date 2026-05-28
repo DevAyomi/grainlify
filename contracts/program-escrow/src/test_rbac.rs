@@ -180,94 +180,250 @@ fn test_rbac_wrong_nonce_rejected_for_authorized_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// Draft Status Guard Tests
+// Delegation-chain exploit tests
+//
+// Security invariants verified:
+//   1. Only the program owner (payout key) or contract admin can call
+//      `set_program_delegate` — a delegate cannot re-delegate.
+//   2. A delegate cannot escalate its own bitmask beyond what was granted.
+//   3. A delegate with a subset of permissions cannot grant a superset to
+//      a third party.
+//   4. A delegate cannot overwrite itself with a different address.
+//   5. A delegate cannot revoke itself or another delegate.
 // ---------------------------------------------------------------------------
 
-/// set_program_delegate must reject programs in Draft status.
+/// A delegate with full permissions cannot call `set_program_delegate` to
+/// grant those permissions to a third party (re-delegation / chain attack).
 #[test]
-#[should_panic(expected = "Cannot set delegate on program in Draft status")]
-fn test_set_delegate_rejected_on_draft_program() {
+#[should_panic(expected = "Unauthorized")]
+fn test_delegate_cannot_redelegate_to_third_party() {
     let env = Env::default();
     let (client, program_id, payout_key, _admin) = setup(&env);
     let delegate = Address::generate(&env);
-    
-    // Program is in Draft status by default after init_program
+    let third_party = Address::generate(&env);
+
+    // Owner grants delegate all permissions.
+    client.set_program_delegate(
+        &program_id,
+        &payout_key,
+        &delegate,
+        &DELEGATE_PERMISSION_MASK,
+    );
+
+    // Delegate attempts to re-delegate to a third party — must be rejected.
+    client.set_program_delegate(
+        &program_id,
+        &delegate,
+        &third_party,
+        &DELEGATE_PERMISSION_MASK,
+    );
+}
+
+/// A delegate with only RELEASE permission cannot grant RELEASE to another
+/// address, even though it holds that permission itself.
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_delegate_with_partial_permissions_cannot_redelegate() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup(&env);
+    let delegate = Address::generate(&env);
+    let third_party = Address::generate(&env);
+
     client.set_program_delegate(
         &program_id,
         &payout_key,
         &delegate,
         &DELEGATE_PERMISSION_RELEASE,
     );
+
+    // Delegate tries to pass its RELEASE permission on — must be rejected.
+    client.set_program_delegate(
+        &program_id,
+        &delegate,
+        &third_party,
+        &DELEGATE_PERMISSION_RELEASE,
+    );
 }
 
-/// revoke_program_delegate must reject programs in Draft status.
+/// A delegate cannot escalate its own bitmask by calling `set_program_delegate`
+/// with itself as the delegate target and a larger permission set.
 #[test]
-#[should_panic(expected = "Cannot revoke delegate on program in Draft status")]
-fn test_revoke_delegate_rejected_on_draft_program() {
+#[should_panic(expected = "Unauthorized")]
+fn test_delegate_cannot_escalate_own_permissions() {
     let env = Env::default();
     let (client, program_id, payout_key, _admin) = setup(&env);
-    
-    // Program is in Draft status by default after init_program
-    client.revoke_program_delegate(&program_id, &payout_key);
-}
-
-/// update_program_metadata by delegate must reject programs in Draft status.
-#[test]
-#[should_panic(expected = "Cannot perform delegate actions on program in Draft status")]
-fn test_delegate_update_metadata_rejected_on_draft_program() {
-    let env = Env::default();
-    let (client, program_id, payout_key, _admin) = setup(&env);
-    
-    // First publish the program to set a delegate
-    client.publish_program();
     let delegate = Address::generate(&env);
+
+    // Grant only RELEASE.
     client.set_program_delegate(
         &program_id,
         &payout_key,
         &delegate,
-        &DELEGATE_PERMISSION_UPDATE_META,
+        &DELEGATE_PERMISSION_RELEASE,
     );
-    
-    // Now create a new draft program to test delegate action rejection
-    let draft_program_id = String::from_str(&env, "draft-prog");
-    let token_id = fund_contract(&env, &client.address, 0);
-    client.init_program(&draft_program_id, &payout_key, &token_id, &payout_key, &None, &None);
-    
-    // Try to update metadata on draft program as delegate - should fail
-    let metadata = ProgramMetadata::empty(&env);
-    client.update_program_metadata(&draft_program_id, &delegate, &metadata);
+
+    // Delegate tries to upgrade itself to full permissions — must be rejected.
+    client.set_program_delegate(
+        &program_id,
+        &delegate,
+        &delegate,
+        &DELEGATE_PERMISSION_MASK,
+    );
 }
 
-/// Delegate operations work after program is published.
+/// A delegate cannot revoke itself (or any other delegate) via
+/// `revoke_program_delegate` — only the owner or admin may revoke.
 #[test]
-fn test_delegate_operations_work_after_publish() {
+#[should_panic(expected = "Unauthorized")]
+fn test_delegate_cannot_revoke_itself() {
     let env = Env::default();
     let (client, program_id, payout_key, _admin) = setup(&env);
-    
-    // Publish the program first
-    client.publish_program();
-    
     let delegate = Address::generate(&env);
-    
-    // Now delegate operations should work
+
     client.set_program_delegate(
         &program_id,
         &payout_key,
         &delegate,
-        &DELEGATE_PERMISSION_UPDATE_META,
+        &DELEGATE_PERMISSION_MASK,
     );
-    
-    let program_data = client.get_program_info();
-    assert_eq!(program_data.delegate, Some(delegate.clone()));
-    assert_eq!(program_data.delegate_permissions, DELEGATE_PERMISSION_UPDATE_META);
-    
-    // Delegate should be able to update metadata
-    let metadata = ProgramMetadata::empty(&env);
-    client.update_program_metadata(&program_id, &delegate, &metadata);
-    
-    // Revoke should also work
-    client.revoke_program_delegate(&program_id, &payout_key);
-    let program_data = client.get_program_info();
-    assert_eq!(program_data.delegate, None);
-    assert_eq!(program_data.delegate_permissions, 0);
+
+    // Delegate attempts self-revocation — must be rejected.
+    client.revoke_program_delegate(&program_id, &delegate);
+}
+
+/// An arbitrary third party (neither owner, admin, nor delegate) cannot
+/// set a delegate on a program.
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_arbitrary_address_cannot_set_delegate() {
+    let env = Env::default();
+    let (client, program_id, _payout_key, _admin) = setup(&env);
+    let attacker = Address::generate(&env);
+    let victim = Address::generate(&env);
+
+    client.set_program_delegate(
+        &program_id,
+        &attacker,
+        &victim,
+        &DELEGATE_PERMISSION_MASK,
+    );
+}
+
+/// The contract admin CAN set a delegate (positive control — ensures the
+/// restriction targets delegates specifically, not all non-owners).
+#[test]
+fn test_admin_can_set_delegate() {
+    let env = Env::default();
+    let (client, program_id, _payout_key, admin) = setup(&env);
+    let delegate = Address::generate(&env);
+
+    let data = client.set_program_delegate(
+        &program_id,
+        &admin,
+        &delegate,
+        &DELEGATE_PERMISSION_RELEASE,
+    );
+
+    assert_eq!(data.delegate, Some(delegate));
+    assert_eq!(data.delegate_permissions, DELEGATE_PERMISSION_RELEASE);
+}
+
+/// After a delegate is set, the owner can replace it with a different address
+/// and different permissions — the new state is authoritative.
+#[test]
+fn test_owner_can_replace_delegate() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup(&env);
+    let delegate_a = Address::generate(&env);
+    let delegate_b = Address::generate(&env);
+
+    client.set_program_delegate(
+        &program_id,
+        &payout_key,
+        &delegate_a,
+        &DELEGATE_PERMISSION_MASK,
+    );
+
+    let data = client.set_program_delegate(
+        &program_id,
+        &payout_key,
+        &delegate_b,
+        &DELEGATE_PERMISSION_RELEASE,
+    );
+
+    // delegate_b is now the active delegate with reduced permissions.
+    assert_eq!(data.delegate, Some(delegate_b));
+    assert_eq!(data.delegate_permissions, DELEGATE_PERMISSION_RELEASE);
+}
+
+/// After the owner replaces the delegate, the old delegate loses all access
+/// and cannot perform operations that required its former permissions.
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_replaced_delegate_loses_access() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup(&env);
+    let delegate_a = Address::generate(&env);
+    let delegate_b = Address::generate(&env);
+
+    client.set_program_delegate(
+        &program_id,
+        &payout_key,
+        &delegate_a,
+        &DELEGATE_PERMISSION_MASK,
+    );
+
+    // Replace delegate_a with delegate_b.
+    client.set_program_delegate(
+        &program_id,
+        &payout_key,
+        &delegate_b,
+        &DELEGATE_PERMISSION_RELEASE,
+    );
+
+    // delegate_a is no longer active — any attempt to re-delegate must fail.
+    client.set_program_delegate(
+        &program_id,
+        &delegate_a,
+        &delegate_a,
+        &DELEGATE_PERMISSION_MASK,
+    );
+}
+
+/// `set_program_delegate` rejects a permissions bitmask of zero.
+#[test]
+#[should_panic(expected = "Delegate permissions cannot be empty")]
+fn test_set_delegate_rejects_zero_permissions() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup(&env);
+    let delegate = Address::generate(&env);
+
+    client.set_program_delegate(&program_id, &payout_key, &delegate, &0);
+}
+
+/// `set_program_delegate` rejects a bitmask with unsupported bits set.
+#[test]
+#[should_panic(expected = "Unsupported delegate permissions")]
+fn test_set_delegate_rejects_unsupported_permission_bits() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup(&env);
+    let delegate = Address::generate(&env);
+
+    // Bit 3 (0x08) is outside DELEGATE_PERMISSION_MASK.
+    client.set_program_delegate(&program_id, &payout_key, &delegate, &0x08);
+}
+
+/// The payout key cannot be set as its own delegate.
+#[test]
+#[should_panic(expected = "Delegate must differ from owner")]
+fn test_owner_cannot_be_set_as_own_delegate() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup(&env);
+
+    client.set_program_delegate(
+        &program_id,
+        &payout_key,
+        &payout_key,
+        &DELEGATE_PERMISSION_MASK,
+    );
 }

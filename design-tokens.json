@@ -198,18 +198,29 @@
       "border": "1px solid rgba(255 255 255 / 0.2)"
     }
   },
-  "modal": {
-    "zIndexBase": 10000,
-    "overlayOpacity": {
-      "base": 0.5,
-      "nestedIncrement": 0.04,
-      "max": 0.62
+  "notification": {
+    "badge": {
+      "background": "#ef4444",
+      "text": "#ffffff",
+      "border-light": "#ffffff",
+      "border-dark": "#2d2820",
+      "overflow": "99+"
     },
-    "borderRadius": "1.5rem",
-    "shadow": "0 20px 60px rgba(0, 0, 0, 0.3)",
-    "maxHeight": "90vh",
-    "focusRing": "2px solid var(--color-primary-600)",
-    "animationDuration": "200ms"
+    "type": {
+      "bounty_awarded": { "color": "#f1b400", "icon": "Award" },
+      "submission_received": { "color": "#22c55e", "icon": "GitPullRequest" },
+      "pr_reviewed": { "color": "#c9983a", "icon": "GitMerge" },
+      "payout_confirmed": { "color": "#16a34a", "icon": "Wallet" },
+      "system_alert": { "color": "#f59e0b", "icon": "AlertTriangle" }
+    },
+    "group": {
+      "label": {
+        "today": "Today",
+        "yesterday": "Yesterday",
+        "this_week": "This Week",
+        "earlier": "Earlier"
+      }
+    }
   },
   "animation": {
     "duration": {

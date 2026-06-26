@@ -868,6 +868,7 @@ impl ContractError {
             ContractError::InvalidRoleProposal => "Invalid role proposal",
             ContractError::RoleRotationNotAllowed => "Role rotation not allowed",
 
+            ContractError::RotationTimelockActive => "Role rotation timelock is active",
             // Release Trigger / Schedule Errors
             ContractError::ReleaseTriggerFailed => "Release trigger failed",
             ContractError::NoSchedulesDue => "No schedules are due for release",

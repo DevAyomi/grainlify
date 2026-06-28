@@ -8,6 +8,7 @@ import { TermsTab } from '../components/terms/TermsTab';
 import { ReferralLink } from '../../dashboard/components/ReferralLink';
 import { useTheme } from '../../../shared/contexts/ThemeContext';
 import { BillingProfilesProvider } from '../contexts/BillingProfilesContext';
+import { RestartTutorialButton } from '../../onboarding';
 
 interface SettingsPageProps {
   initialTab?: SettingsTabType;
@@ -63,6 +64,9 @@ export function SettingsPage({ initialTab = 'profile' }: SettingsPageProps) {
         {activeTab === 'billing' && <BillingTab />}
         {activeTab === 'referrals' && <ReferralLink />}
         {activeTab === 'terms' && <TermsTab />}
+
+        {/* Persistent onboarding re-entry point — visible on every tab */}
+        <RestartTutorialButton />
       </div>
     </BillingProfilesProvider>
   );

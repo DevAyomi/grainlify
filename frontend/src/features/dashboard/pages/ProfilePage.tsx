@@ -36,6 +36,11 @@ export interface Badge {
   ecosystem?: string;
 }
 
+/**
+ * Design contract for the proposed ProfilePage skill endorsement UI.
+ * See: design/specs/skill-endorsement-ui.md
+ */
+
 interface ProfileData {
   contributions_count: number;
   languages: Array<{ language: string; contribution_count: number }>;
